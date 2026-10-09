@@ -1,0 +1,30 @@
+name: publish
+on:
+  release:
+    types: [published]
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  publish:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+      - name: Require npm 11.15 or newer
+        run: node -e "const [a,b]=process.argv[1].split('.').map(Number); if (a<11||(a===11&&b<15)) { console.error('npm '+process.argv[1]+' is too old for staged publishing'); process.exit(1) }" "$(npm --version)"
+      - run: npm ci --ignore-scripts
+      - name: Install qpdf and poppler-utils
+        # The qpdf cross-checks in the tests fail when qpdf is missing.
+        run: |
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qpdf poppler-utils
+          qpdf --version
+          pdftotext -v
+      # prepublishOnly cleans, builds and runs the whole suite before anything is staged.
+      - run: npm stage publish

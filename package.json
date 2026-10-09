@@ -1,0 +1,88 @@
+{
+  "name": "@patrickdk77/pdf-defuse",
+  "version": "0.1.0",
+  "description": "Sanitize and clean PDF files. Detects and removes JavaScript, attached files, launch actions, unsafe links and empty-password encryption, scores the risk, and writes a disarmed copy with bounded memory and no runtime dependencies.",
+  "license": "MIT",
+  "author": "patrickdk77",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "pdf-defuse": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('build-test',{recursive:true,force:true})\"",
+    "build": "tsc -p tsconfig.json && node scripts/write-esm-wrapper.js",
+    "build:test": "tsc -p tsconfig.test.json",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "test": "npm run lint && npm run build && npm run build:test && mocha --timeout 120000 \"build-test/test/**/*.test.js\"",
+    "validate": "npm run build && node scripts/validate-corpus.js",
+    "prepare": "husky || true",
+    "prepublishOnly": "npm run clean && npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/patrickdk77/pdf-defuse.git"
+  },
+  "bugs": {
+    "url": "https://github.com/patrickdk77/pdf-defuse/issues"
+  },
+  "homepage": "https://github.com/patrickdk77/pdf-defuse",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pdf",
+    "sanitize",
+    "sanitise",
+    "scrub",
+    "cleaner",
+    "cleaning",
+    "disarm",
+    "defuse",
+    "defang",
+    "cdr",
+    "strip",
+    "security",
+    "inspect",
+    "scanner",
+    "detect",
+    "encrypted",
+    "decrypt",
+    "attachments"
+  ],
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.15",
+    "@cantoo/pdf-lib": "^2.11.1",
+    "@types/chai": "^5.2.3",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^22.20.5",
+    "chai": "^6.3.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "mocha": "^12.0.3",
+    "pdfjs-dist": "^6.4.299",
+    "typescript": "^7.0.2"
+  },
+  "lint-staged": {
+    "*.{ts,js,mjs,cjs,json,jsonc}": "biome check --write --no-errors-on-unmatched --files-ignore-unknown=true"
+  }
+}

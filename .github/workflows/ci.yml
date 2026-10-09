@@ -1,0 +1,31 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-slim
+    strategy:
+      matrix:
+        node: ['22', '24', '26']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - run: npm ci --ignore-scripts
+      - name: Install qpdf and poppler-utils
+        # The qpdf cross-checks in the tests fail when qpdf is missing.
+        run: |
+          SUDO=$(command -v sudo || true)
+          $SUDO apt-get update
+          $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends qpdf poppler-utils
+          qpdf --version
+          pdftotext -v
+      - run: npm test
+      - name: Package contents
+        run: npm pack --dry-run
