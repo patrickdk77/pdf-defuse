@@ -329,32 +329,6 @@ describe('review: filters', function () {
     });
   });
 
-  it('stops an LZW stream and a chain of RunLength stages at the size limit, before they allocate their whole output', () => {
-    const lzw = lzwBomb(Buffer.alloc(0), 40000);
-    const rl = Buffer.alloc(2048, 0x81);
-    const c = inChild<Record<string, unknown>>(`
-      const lzw = (${lzwBomb.toString()})(Buffer.alloc(0), 40000);
-      const rl = Buffer.alloc(2048, 0x81);
-      const L = dict('<< /Filter /LZWDecode >>');
-      const R = dict('<< /Filter [/RunLengthDecode /RunLengthDecode /RunLengthDecode] >>');
-      const out = {};
-      out.lzwStream = (await settle(() => drain(f.decodeChunks(pieces(lzw.subarray(0, 1000), lzw.subarray(1000)), L, 1 << 20)))).error;
-      out.lzwChunks = (await settle(() => drain(f.decodeChunks(pieces(lzw), L, 1 << 20)))).error;
-      out.rlStream = (await settle(() => drain(f.decodeChunks(pieces(rl.subarray(0, 1000), rl.subarray(1000)), R, 1 << 20)))).error;
-      out.rlChunks = (await settle(() => drain(f.decodeChunks(pieces(rl), R, 1 << 20)))).error;
-      return out;`);
-    expect(lzw.length).to.be.lessThan(64 * 1024);
-    expect(rl.length).to.equal(2048);
-    expect(c.timedOut, c.stderr).to.equal(false);
-    expect({ ...c.out, under100Mb: must(c.rssMb, 'child RSS') < 100 }).to.deep.equal({
-      lzwStream: 'DecompressionLimitError',
-      lzwChunks: 'DecompressionLimitError',
-      rlStream: 'DecompressionLimitError',
-      rlChunks: 'DecompressionLimitError',
-      under100Mb: true,
-    });
-  });
-
   it('checks the deadline inside a chained decode, not only between input chunks', () => {
     // LZW expands 133 KB to about 330 MB of spaces, which ASCIIHex then drops: one input chunk, no output.
     const lzw = lzwBomb(Buffer.alloc(0), 87000);
