@@ -1,13 +1,16 @@
 name: publish
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
 permissions:
   contents: read
-  id-token: write
 jobs:
   publish:
     runs-on: ubuntu-slim
+    permissions:
+      # contents: write creates the GitHub release; id-token: write is npm trusted publishing.
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -15,6 +18,10 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
+      - name: Require the tag to match package.json
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $want"; exit 1; fi
       - name: Require npm 11.15 or newer
         run: node -e "const [a,b]=process.argv[1].split('.').map(Number); if (a<11||(a===11&&b<15)) { console.error('npm '+process.argv[1]+' is too old for staged publishing'); process.exit(1) }" "$(npm --version)"
       - run: npm ci --ignore-scripts
@@ -28,3 +35,7 @@ jobs:
           pdftotext -v
       # prepublishOnly cleans, builds and runs the whole suite before anything is staged.
       - run: npm stage publish
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
