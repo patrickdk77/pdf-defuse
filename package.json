@@ -1,6 +1,6 @@
 {
   "name": "@patrickdk77/pdf-defuse",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Sanitize and clean PDF files. Detects and removes JavaScript, attached files, launch actions, unsafe links and empty-password encryption, scores the risk, and writes a disarmed copy with bounded memory and no runtime dependencies.",
   "license": "MIT",
   "author": "patrickdk77",
