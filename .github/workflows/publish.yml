@@ -18,10 +18,8 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
-      - name: Require the tag to match package.json
-        run: |
-          want="v$(node -p "require('./package.json').version")"
-          if [ "$GITHUB_REF_NAME" != "$want" ]; then echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $want"; exit 1; fi
+      - name: Take the version from the tag
+        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
       - name: Require npm 11.15 or newer
         run: node -e "const [a,b]=process.argv[1].split('.').map(Number); if (a<11||(a===11&&b<15)) { console.error('npm '+process.argv[1]+' is too old for staged publishing'); process.exit(1) }" "$(npm --version)"
       - run: npm ci --ignore-scripts
