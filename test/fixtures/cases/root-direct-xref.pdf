@@ -1,0 +1,8 @@
+%PDF-1.7
+xref
+0 0
+trailer
+<< /Root << /Pages << /Type /Pages /Kids [<< /Type /Page /MediaBox [0 0 612 792] >>] /Count 1 >> /OpenAction << /S /JavaScript /JS (app.alert\("pdf-defuse fixture"\);) >> >> >>
+startxref
+9
+%%EOF

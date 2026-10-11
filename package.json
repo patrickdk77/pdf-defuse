@@ -1,6 +1,6 @@
 {
   "name": "@patrickdk77/pdf-defuse",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Sanitize and clean PDF files. Detects and removes JavaScript, attached files, launch actions, unsafe links and empty-password encryption, scores the risk, and writes a disarmed copy with bounded memory and no runtime dependencies.",
   "license": "MIT",
   "author": "patrickdk77",
@@ -25,7 +25,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=18.0.0"
   },
   "scripts": {
     "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true});require('fs').rmSync('build-test',{recursive:true,force:true})\"",
@@ -74,7 +74,7 @@
     "@cantoo/pdf-lib": "^2.11.1",
     "@types/chai": "^5.2.3",
     "@types/mocha": "^10.0.10",
-    "@types/node": "^22.20.5",
+    "@types/node": "^18.19.130",
     "chai": "^6.3.0",
     "husky": "^9.1.7",
     "lint-staged": "^17.6.0",

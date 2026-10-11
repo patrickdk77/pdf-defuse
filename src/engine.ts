@@ -40,7 +40,8 @@ function encryptionFindings(doc: PdfDocument, factory: FindingFactory): PdfFindi
   if (!r) return [];
   const out: PdfFinding[] = [];
   if (r.status === 'ok') {
-    out.push(factory.make(C.Encrypted, r.password === 'empty' ? D.EmptyPassword : r.password === 'owner' ? D.OwnerPassword : D.UserPassword));
+    const detail = { empty: D.EmptyPassword, user: D.UserPassword, owner: D.OwnerPassword, none: D.AttachmentsOnly }[r.password];
+    out.push(factory.make(C.Encrypted, detail));
     const bits = r.handler.keyBits;
     const method = r.handler.streamMethod === 'Identity' ? r.handler.stringMethod : r.handler.streamMethod;
     if (method === 'AES256') out.push(factory.make(C.Encrypted, D.Aes256));
@@ -119,6 +120,7 @@ async function analyzeInner(run: Run, source: ByteSource, options: PdfOptions, d
   run.doc = doc;
   findings.push(...encryptionFindings(doc, factory));
   if (doc.securityResult && doc.securityResult.status !== 'ok') return finish(findings, options, true, doc.headerVersion);
+  if (doc.missingHeader) findings.push(factory.make(C.Corrupted, D.MissingHeader));
   if (doc.headerOffset > 0) findings.push(factory.make(C.Corrupted, D.LeadingBytes, undefined, { bytes: doc.headerOffset }));
   if (doc.trailingBytes > 0) findings.push(factory.make(C.Corrupted, D.TrailingBytes, undefined, { bytes: doc.trailingBytes }));
   if (doc.rebuilt) findings.push(factory.make(C.Corrupted, D.XrefRebuilt));
@@ -151,6 +153,10 @@ async function analyzeInner(run: Run, source: ByteSource, options: PdfOptions, d
   if (issues.xrefStmOverFree)
     findings.push(factory.make(C.Corrupted, D.MalformedObject, 'cross-reference table', { reason: '/XRefStm entries for objects the table marks free', count: issues.xrefStmOverFree }));
   if (issues.badObjStm.size) findings.push(factory.make(C.Corrupted, D.MalformedObject, 'object stream', { reason: 'a header pdf.js cannot follow', count: issues.badObjStm.size }));
+  if (issues.objStmType.size) findings.push(factory.make(C.Corrupted, D.MalformedObject, 'object stream', { reason: 'a /Type other than /ObjStm', count: issues.objStmType.size }));
+  if (issues.directRoot) findings.push(factory.make(C.Corrupted, D.MalformedObject, 'trailer', { reason: 'a catalog written in the trailer' }));
+  if (issues.directStreams.size) findings.push(factory.make(C.Corrupted, D.MalformedObject, undefined, { reason: 'streams written inside other objects', count: issues.directStreams.size }));
+  if (issues.objStmStreams.size) findings.push(factory.make(C.Corrupted, D.MalformedObject, 'object stream', { reason: 'streams stored in an object stream', count: issues.objStmStreams.size }));
   if (issues.refGen.size) findings.push(factory.make(C.Corrupted, D.MalformedObject, undefined, { reason: 'references whose generation does not match the object', count: issues.refGen.size }));
   if (issues.duplicateKeys.size)
     findings.push(factory.make(C.Corrupted, D.MalformedObject, undefined, { reason: 'repeated dictionary keys', keys: [...issues.duplicateKeys].slice(0, 10).join(', ') }));

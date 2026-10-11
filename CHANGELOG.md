@@ -1,6 +1,51 @@
 # Changelog
 
-## 0.1.0 - unreleased
+## 0.2.0 - 2026-10-11
+
+### Damaged files
+
+pdf-defuse reads damaged files the way pdf.js reads them. A CORRUPTED finding reports each repair, and the output holds the repaired structure. Files 0.1.2 rejected or misread:
+
+- No `%PDF-` header in the first 1024 bytes. The new CORRUPTED/MISSING_HEADER finding reports it, and the output gets a header.
+- A catalog written in the trailer as a dictionary.
+- A stream written inside another object, such as page content given directly as `/Contents`, or stored in an object stream.
+- A cross-reference table that has to be rebuilt. The rebuild ignores objects and trailers inside comments, reads a trailer the end of the file cuts off, and picks the trailer pdf.js picks. It also runs when a page tree entry points at the wrong object, as in pdf.js.
+- Object streams with a `/Type` other than `/ObjStm`, offsets that go backwards, or objects the header does not name.
+- A stray `R`, `true`, `false`, `null` or number where a dictionary key belongs.
+- A stream whose `/Length` is not a whole number, or with text after the `stream` keyword.
+- A `/Prev`, `/XRefStm` or object stream offset that points before the start of its data.
+- A free row in a cross-reference table that its `/XRefStm` also gives. The row stays free.
+- Page content marked `/Type /EmbeddedFile`. It stays page content instead of going as an attached file.
+- A page whose `/Contents` or `/Annots` points at an object that does not exist. Such a file failed its own output check.
+
+### Encryption
+
+- A revision 6 password is tried with SASLprep, with pdf.js's preparation, and as typed. A password that needs SASLprep, such as one with a soft hyphen, now opens its file, and every file that opened in 0.1.2 still opens.
+- An empty owner password opens a file, as in qpdf, and ENCRYPTED/OWNER_PASSWORD reports it. pdf.js asks for a password there.
+- A file that encrypts only its attached files opens without the password, and the new ENCRYPTED/ATTACHMENTS_ONLY finding reports it. pdf-defuse removes the attached files the password does not decrypt and any other stream under their key, which the new ENCRYPTED/NO_KEY finding reports.
+
+### Filters
+
+- pdf-defuse decodes BrotliDecode streams, so the objects, scripts and attached files inside them get the same checks. It refuses a BrotliDecode stream with a predictor, and a chain with two of them.
+
+### Memory and time
+
+- Each object stream is decoded once. Decoded object streams share `memoryThreshold` of memory and spill to a temporary file. 0.1.2 decoded one again on every lookup that missed its cache of eight, so a 60 KB file whose objects alternated across nine streams took 31 seconds.
+- Padding no longer costs memory. In 0.1.2, 128 MB of padding after the last object of an object stream took 280 MB.
+
+### Sources
+
+- `bufferSource`, `fileSource` and a plugin's source return no bytes for a read that starts outside the data or at an offset that is not a whole number. `bufferSource` used to return bytes from the start of the buffer, and `fileSource` misread or threw.
+
+### Package
+
+- `engines` asks for Node 18 instead of 22. Nothing in the package needed 22.
+
+## 0.1.2 - 2026-10-09
+
+The package is the same as 0.1.0. It is the first release published from GitHub Actions, with a provenance attestation.
+
+## 0.1.0 - 2026-10-09
 
 First release.
 

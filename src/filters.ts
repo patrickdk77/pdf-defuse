@@ -422,6 +422,13 @@ function syncDecoder(name: string, parms?: PdfDict): Decoder[] | undefined {
       return [new RunLengthDecoder()];
     case 'Crypt':
       return [];
+    case 'BrotliDecode': {
+      // PDFium applies a predictor named here and pdf.js ignores it, so a predicted stream reads two ways and is not
+      // decoded.
+      const predictor = parms?.get('Predictor') ?? null;
+      if (predictor !== null && predictor !== 1) throw new UnsupportedFilterError('A predictor on BrotliDecode, which readers apply differently');
+      return [];
+    }
     default:
       return undefined;
   }
@@ -444,6 +451,12 @@ const SLICE = 4096;
  * context for Flate, and a few thousand nested stages overflow the stack, so a longer chain counts as unsupported.
  */
 const MAX_FILTERS = 32;
+
+/**
+ * Brotli decoders in one chain. Each can take a 16 MB window from a few hundred bytes of input, and the stages of a
+ * chain all run at once.
+ */
+const MAX_BROTLI = 1;
 
 /**
  * Where raw deflate data starts: after the zlib header when there is one. The Adler-32 trailer is then never
@@ -475,18 +488,51 @@ async function* inflateChunks(input: AsyncIterable<Uint8Array>): AsyncGenerator<
       yield r.value;
     }
   }
-  const inflater = zlib.createInflateRaw({ finishFlush: zlib.constants.Z_SYNC_FLUSH });
-  const src = stream.Readable.from(rest());
-  src.on('error', e => inflater.destroy(e));
-  src.pipe(inflater);
+  // Truncated data ends quietly with everything decoded. Corrupt data throws: Node drops the output of the write that
+  // failed, so the bytes before the error are not all there.
+  yield* through(rest(), zlib.createInflateRaw({ finishFlush: zlib.constants.Z_SYNC_FLUSH }));
+}
+
+/** Pipes `input` through a zlib transform and yields its output. */
+async function* through(input: AsyncIterable<Uint8Array>, transform: stream.Transform): AsyncGenerator<Uint8Array> {
+  const src = stream.Readable.from(input);
+  src.on('error', e => transform.destroy(e));
+  src.pipe(transform);
   try {
-    // Truncated data ends quietly with everything decoded. Corrupt data throws: Node drops the output of the write
-    // that failed, so the bytes before the error are not all there.
-    for await (const c of inflater) yield c as Buffer;
+    for await (const c of transform) yield c as Buffer;
   } finally {
     src.destroy();
-    inflater.destroy();
+    transform.destroy();
   }
+}
+
+/**
+ * BrotliDecode: RFC 7932 data with no header. pdf.js decodes such a stream whole or not at all, so data that is
+ * truncated, corrupt or followed by more bytes throws here. Empty data decodes to nothing, as in pdf.js.
+ */
+async function* brotliChunks(input: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+  const it = input[Symbol.asyncIterator]();
+  let first: Uint8Array | undefined;
+  while (!first?.length) {
+    const r = await it.next();
+    if (r.done) return;
+    first = r.value;
+  }
+  let fed = 0;
+  async function* rest(head: Uint8Array) {
+    fed += head.length;
+    yield head;
+    for (;;) {
+      const r = await it.next();
+      if (r.done) return;
+      fed += r.value.length;
+      yield r.value;
+    }
+  }
+  const decoder = zlib.createBrotliDecompress();
+  yield* through(rest(first), decoder);
+  // Node stops reading at the end of the Brotli data and ignores what follows it.
+  if (decoder.bytesWritten < fed) throw new Error('Data after the end of the Brotli stream');
 }
 
 /**
@@ -522,10 +568,12 @@ export async function* decodeChunks(input: AsyncIterable<Uint8Array>, dict: PdfD
   ) {
     throw new UnsupportedFilterError('Filter entries that readers take in different ways');
   }
+  if (filters.filter(x => x.name === 'BrotliDecode').length > MAX_BROTLI) throw new UnsupportedFilterError('More than one BrotliDecode in one chain');
   for (const { name, parms } of filters) {
     const decs = syncDecoder(name, parms);
     if (!decs) throw new UnsupportedFilterError(`Unsupported filter ${name}`);
     if (name === 'FlateDecode' || name === 'Fl') chain = counted(inflateChunks(chain));
+    else if (name === 'BrotliDecode') chain = counted(brotliChunks(chain));
     for (const d of decs) {
       const upstream = chain;
       chain = counted(

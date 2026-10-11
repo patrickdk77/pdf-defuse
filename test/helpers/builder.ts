@@ -47,6 +47,10 @@ export interface BuildOptions {
   trailerExtra?: string;
   /** Write a wrong startxref offset. */
   badStartxref?: boolean;
+  /** Replaces the header lines. An empty string writes none. */
+  header?: string;
+  /** The trailer's /Root value, such as a catalog written there, in place of a reference to `root`. */
+  rootValue?: string;
 }
 
 /** Builds PDFs from raw object bodies, so tests can craft exact structures. */
@@ -81,7 +85,7 @@ export class PdfBuilder {
     };
     if (o.leading) push(o.leading);
     const base = o.leading ? Buffer.byteLength(o.leading, 'latin1') : 0;
-    push(`%PDF-${o.version ?? '1.7'}\n%\xE2\xE3\xCF\xD3\n`);
+    push(o.header ?? `%PDF-${o.version ?? '1.7'}\n%\xE2\xE3\xCF\xD3\n`);
     const offsets = new Map<number, number>();
     const inStream = new Map<number, [number, number]>();
     const nums = [...this.objects.keys()].sort((a, b) => a - b);
@@ -105,7 +109,7 @@ export class PdfBuilder {
       offsets.set(stmNum, offset - base);
       push(serializeObject(stmNum, { dict: `<< /Type /ObjStm /N ${packable.length} /First ${header.length + 1} >>`, stream: data, deflate: true }));
     }
-    const trailerKeys = `/Root ${this.root} 0 R${this.info ? ` /Info ${this.info} 0 R` : ''}${o.trailerExtra ? ` ${o.trailerExtra}` : ''}`;
+    const trailerKeys = `/Root ${o.rootValue ?? `${this.root} 0 R`}${this.info ? ` /Info ${this.info} 0 R` : ''}${o.trailerExtra ? ` ${o.trailerExtra}` : ''}`;
     if (o.xref === 'none') {
       push(`trailer\n<< ${trailerKeys} >>\n%%EOF\n`);
     } else if (o.xref === 'stream') {

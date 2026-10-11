@@ -21,6 +21,8 @@ def(C.Encrypted, D.EmptyPassword, 'strip', 10, 'PDF encrypted with an empty user
 def(C.Encrypted, D.UserPassword, 'strip', 0, 'PDF decrypted with the supplied user password');
 def(C.Encrypted, D.OwnerPassword, 'strip', 0, 'PDF decrypted with the supplied owner password');
 def(C.Encrypted, D.PasswordRequired, 'reject', 0, 'PDF requires a password, and the one supplied did not open it');
+def(C.Encrypted, D.AttachmentsOnly, 'strip', 10, 'Only the attached files are encrypted, and the password supplied does not open them');
+def(C.Encrypted, D.NoKey, 'strip', 10, "Content encrypted with the attached files' key was removed, since the password supplied does not give that key");
 def(C.Encrypted, D.CertificateHandler, 'reject', 0, "PDF encrypted for specific recipients' certificates");
 def(C.Encrypted, D.UnknownHandler, 'reject', 0, 'PDF uses an unrecognized security handler');
 def(C.Encrypted, D.UnknownCryptFilter, 'reject', 0, 'PDF uses an unrecognized encryption filter');
@@ -38,6 +40,7 @@ def(C.Corrupted, D.MalformedObject, 'strip', 10, 'An object has the wrong type f
 def(C.Corrupted, D.StreamLengthWrong, 'strip', 10, "A stream's declared length is missing or wrong");
 def(C.Corrupted, D.LeadingBytes, 'strip', 5, 'Data before the PDF header');
 def(C.Corrupted, D.TrailingBytes, 'strip', 10, 'Data after the end of the PDF');
+def(C.Corrupted, D.MissingHeader, 'strip', 5, 'No PDF header at the start of the file');
 // JAVASCRIPT
 def(C.JavaScript, D.Document, 'strip', 70, 'Document-level JavaScript runs when the PDF opens');
 def(C.JavaScript, D.OpenAction, 'strip', 70, 'JavaScript runs when the PDF opens');

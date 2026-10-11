@@ -1,0 +1,10 @@
+% a script in a filtered stream
+%PDF-1.4
+1 0 obj
+<< /Filter /ASCII85Decode >>
+stream
+@;p0<@;KLqF=8>PA7dE(AS-(+AKYT!G]\(KAKiQb~>
+endstream
+endobj
+trailer
+<< /Root << /Pages << >> /OpenAction << /S /JavaScript /JS 1 0 R >> >> >>

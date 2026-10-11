@@ -1,12 +1,13 @@
 import * as fsp from 'node:fs/promises';
 import { type ChunkDecryptor, type OpenResult, SecurityHandler } from './crypto';
-import { DecompressionLimitError, decodeChunks } from './filters';
-import { Reader, SpillSink, TempDir } from './io';
-import { PdfDict, type PdfObject, PdfRef, PdfStream, PdfString } from './objects';
-import { isWhite, NeedMoreData, ParseError, Parser } from './parser';
+import { DecompressionLimitError, decodeChunks, filtersOf } from './filters';
+import { bufferSource, fileSource, Reader, SpillSink, TempDir } from './io';
+import { PdfDict, PdfName, type PdfObject, PdfRef, PdfStream, PdfString } from './objects';
+import { type DirectStreams, EndOfData, endstreamIn, isWhite, NeedMoreData, NeedObject, ParseError, Parser } from './parser';
 import type { ByteSource } from './types';
 
-type XrefEntry = { type: 1; offset: number; gen: number } | { type: 2; stream: number };
+/** A compressed object's entry names its object stream and its index there, as pdf.js reads it. */
+type XrefEntry = { type: 1; offset: number; gen: number } | { type: 2; stream: number; index: number };
 
 /**
  * One xref section. `entries` holds the live rows, and `free` the free rows as [start, end) runs, so a section of
@@ -37,11 +38,14 @@ function repeatsANumber(ranges: number[]): boolean {
 
 /** Entries are packed into one number each, so the index costs a few bytes per object. */
 export const packOffset = (offset: number, gen: number) => offset * 65536 + (gen & 0xffff);
-export const packStream = (stream: number) => -stream - 1;
+/** Index values from here up stand for an index too large to keep, which leads to no object. */
+const INDEX_SPAN = 2 ** 21;
+export const packStream = (stream: number, index: number) => -(Math.min(stream, 2 ** 32 - 1) * INDEX_SPAN + Math.min(index, INDEX_SPAN - 1)) - 1;
 export function unpack(v: number | undefined): XrefEntry | undefined {
   if (v === undefined) return undefined;
   if (v >= 0) return { type: 1, offset: Math.floor(v / 65536), gen: v % 65536 };
-  return { type: 2, stream: -v - 1 };
+  const x = -v - 1;
+  return { type: 2, stream: Math.floor(x / INDEX_SPAN), index: x % INDEX_SPAN };
 }
 
 export class OpenError extends Error {
@@ -59,6 +63,8 @@ export class TimeLimitError extends Error {
 }
 class DecodeCapError extends Error {}
 export class ObjectLimitError extends Error {}
+/** Where pdf.js throws XRefEntryException: an entry that points at another object. pdf.js then rebuilds the map. */
+class BrokenEntry extends Error {}
 
 /** Holds at most `max` entries, whose weights add up to at most `maxWeight`. */
 class Lru<K, V> {
@@ -75,6 +81,16 @@ class Lru<K, V> {
       this.map.set(k, e);
     }
     return e?.value;
+  }
+  delete(k: K): V | undefined {
+    const e = this.map.get(k);
+    if (e === undefined) return undefined;
+    this.map.delete(k);
+    this.weight -= e.weight;
+    return e.value;
+  }
+  values(): V[] {
+    return Array.from(this.map.values(), e => e.value);
   }
   /** Returns the last entry pushed out, if any. An entry heavier than the whole cache is kept alone. */
   set(k: K, value: V, weight = 0): V | undefined {
@@ -103,6 +119,82 @@ const objectCache = () => new Lru<number, PdfObject>(2048, 32 * 1024 * 1024);
 const enc = (s: string) => Buffer.from(s, 'latin1');
 const OBJ = enc('obj');
 const view = (u: Uint8Array) => Buffer.from(u.buffer, u.byteOffset, u.byteLength);
+/** pdf.js takes a /Root that is a dictionary written in the trailer as well as a reference to one. */
+const hasRoot = (trailer: PdfDict) => {
+  const r = trailer.get('Root');
+  return r instanceof PdfRef || r instanceof PdfDict;
+};
+/** How many streams written inside one object may take their /Length from another object. */
+const MAX_INDIRECT_LENGTHS = 8;
+/**
+ * The heap that the dictionaries of streams written inside objects may hold for the whole run. An object whose streams
+ * would pass it reads as damaged, as one too large to parse does.
+ */
+const MAX_SYNTHETIC_COST = 32 * 1024 * 1024;
+/** Runs of whitespace one parse may leave out of its window before the window grows over them instead. */
+const MAX_SKIPS = 64;
+const SKIP_CHUNK = 262144;
+let pads: { spaces: Buffer; zeros: Buffer } | undefined;
+const padding = () => {
+  pads ??= { spaces: Buffer.alloc(SKIP_CHUNK, 0x20), zeros: Buffer.alloc(SKIP_CHUNK) };
+  return pads;
+};
+const ENDSTREAM = enc('endstream');
+/** Nodes the page lookups visit or queue. A page tree can name one array of kids from inside each of its kids. */
+const MAX_PAGE_STEPS = 200_000;
+const refKey = (r: PdfRef) => `${r.num} ${r.gen}`;
+
+/** JavaScript's \s, as pdf.js's recovery patterns match it against a file read as Latin-1. */
+const jsSpace = (c: number) => c === 0x20 || (c >= 0x09 && c <= 0x0d) || c === 0xa0;
+/** JavaScript's \w, whose edges are the \b of those patterns. Outside the data counts as no word. */
+const jsWord = (c: number) => (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x5f;
+const isDigitByte = (c: number) => c >= 0x30 && c <= 0x39;
+/** A run of digits as pdf.js turns it into an object number, with JavaScript's `| 0`. */
+function int32(digits: string): number {
+  const d = digits.replace(/^0+/, '');
+  return (d.length > 400 ? Number.POSITIVE_INFINITY : Number(d || '0')) | 0;
+}
+
+/** A file read forward in large chunks for the recovery scan, keeping a few bytes before the current position. */
+class Bytes {
+  private buf: Uint8Array = new Uint8Array(0);
+  private at = 0;
+  constructor(
+    private readonly source: ByteSource,
+    readonly size: number,
+    private readonly onRead: () => void,
+  ) {}
+  /** Whether [pos - 64, pos + ahead) is held, as far as the file goes. */
+  has(pos: number, ahead: number): boolean {
+    return pos >= this.at && (pos - 64 >= this.at || this.at === 0) && Math.min(pos + ahead, this.size) <= this.at + this.buf.length;
+  }
+  async load(pos: number, ahead: number): Promise<void> {
+    this.onRead();
+    this.at = Math.max(0, pos - 64);
+    this.buf = await this.source.read(this.at, Math.min(Math.max(1 << 20, pos - this.at + ahead), this.size - this.at));
+  }
+  /** The byte at `pos`, which has() said is held, or -1 outside the file. */
+  get(pos: number): number {
+    return pos < 0 || pos >= this.size ? -1 : this.buf[pos - this.at];
+  }
+  /** Whether `word` starts at `pos`, which has() said is held with room for it. */
+  is(pos: number, word: string): boolean {
+    for (let i = 0; i < word.length; i++) if (this.get(pos + i) !== word.charCodeAt(i)) return false;
+    return true;
+  }
+  /** The first `needle` in [pos, end), or `end`. */
+  async find(pos: number, needle: Uint8Array, end = this.size): Promise<number> {
+    for (let p = pos; p + needle.length <= end; ) {
+      if (!this.has(p, needle.length)) await this.load(p, needle.length);
+      const stop = Math.min(end, this.at + this.buf.length);
+      const k = view(this.buf.subarray(0, stop - this.at)).indexOf(needle, p - this.at);
+      if (k >= 0) return this.at + k;
+      if (stop >= end) break;
+      p = Math.max(p + 1, stop - needle.length + 1);
+    }
+    return end;
+  }
+}
 
 interface DocumentIssues {
   escapedNames: Set<string>;
@@ -124,8 +216,16 @@ interface DocumentIssues {
   xrefStmOverFree: number;
   /** Object streams whose header pdf.js refuses, offsets that do not increase or numbers that are not whole. */
   badObjStm: Set<number>;
+  /** Object streams an entry names whose /Type is not /ObjStm, which pdf.js reads and qpdf warns about. */
+  objStmType: Set<number>;
+  /** Streams written inside other objects, by the object and where the body starts. Only indirect objects may be streams. */
+  directStreams: Set<string>;
+  /** A catalog written in the trailer, which pdf.js reads and qpdf does not. */
+  directRoot: boolean;
   /** Objects referenced with a generation their entry does not have, which pdf.js refuses to resolve. */
   refGen: Set<number>;
+  /** Streams stored in an object stream, which pdf.js reads from the decoded data. */
+  objStmStreams: Set<number>;
   /** Parts held in a temporary file instead of memory. */
   memoryFallback: string[];
 }
@@ -139,17 +239,30 @@ interface OpenOptions {
   memoryThreshold?: number;
 }
 
-interface ObjStmData {
-  reader: Reader;
+/** A decoded object stream, and the parts of its header that lookups can reach. */
+interface ObjStm {
   size: number;
-  offsets: Map<number, number>;
   first: number;
+  /** The decoded data: in memory, in the shared temporary file at this offset, or in a temporary file of its own. */
+  mem?: Uint8Array;
+  pooled?: number;
+  path?: string;
+  /** By object number, the index of the last header pair that names it. */
+  byNum: Map<number, number>;
+  /** The offsets of the header pairs that lookups can reach, and of the pairs after them, by index. */
+  offsets: Map<number, number>;
+  /** How many header pairs were read. */
+  pairs: number;
+  /** pdf.js reads no object from the first one whose next one starts before it. */
+  badFrom?: number;
 }
 
 /** A PDF opened for random access. Objects are read on demand and never all held at once. */
 export class PdfDocument {
   headerOffset = 0;
   headerVersion = '1.4';
+  /** No "%PDF-" in the first 1024 bytes, where pdf.js looks for one before it parses the file all the same. */
+  missingHeader = false;
   /** Added to every offset when the file has bytes before its header and the xref ignores them. */
   private base = 0;
   /** Object number to packed entry. */
@@ -174,15 +287,53 @@ export class PdfDocument {
     badXRefStm: 0,
     xrefStmOverFree: 0,
     badObjStm: new Set(),
+    objStmType: new Set(),
+    directStreams: new Set(),
+    directRoot: false,
     refGen: new Set(),
+    objStmStreams: new Set(),
     memoryFallback: [],
   };
-  /** Body offsets of the streams already counted in issues.streamLengthWrong, so a second read adds nothing. */
-  private readonly lengthWrongAt = new Set<number>();
+  /**
+   * Objects with no entry of their own: a catalog written in the trailer, and streams written inside other objects.
+   * Their numbers are negative, so no object of the file can take one, and the writer gives each a number of its own.
+   * `key` names the object whose key decrypts a stream, and is null for one that is never encrypted.
+   */
+  private readonly synthetic = new Map<number, { obj: PdfObject; key: { num: number; gen: number } | null }>();
+  /** Synthetic numbers by the object that holds the stream and where its body starts, so a second read reuses one. */
+  private readonly syntheticAt = new Map<string, number>();
+  /** The walker numbers the name trees it writes -1 and -2. */
+  private nextSynthetic = -16;
+  /** Streams whose bodies sit in a decoded object stream, by object or synthetic number, and where they sit there. */
+  private readonly heldBodies = new Map<number, { stm: number; offset: number; length: number }>();
+  /** What the streams inside each object hold, by that object, and the total, which MAX_SYNTHETIC_COST bounds. */
+  private readonly syntheticCost = new Map<string, number>();
+  private syntheticTotal = 0;
+  /** Values of the indirect /Length entries of streams written inside objects. */
+  private directLengths = new Map<number, number | undefined>();
+  /** The streams already counted in issues.streamLengthWrong, so a second read adds nothing. */
+  private readonly lengthWrongAt = new Set<string>();
   private objCache = objectCache();
-  private objStmCache = new Lru<number, ObjStmData>(8);
-  /** Object streams that spilled to a temporary file. Kept for the life of the document, so each is decoded once. */
-  private readonly spilledObjStm = new Map<number, Omit<ObjStmData, 'reader'> & { path: string; source: ByteSource }>();
+  /**
+   * The object streams decoded since the map or the key last changed, or null for one that does not read. Each is
+   * decoded once: memory holds them up to memoryThreshold, and the rest go to temporary files.
+   */
+  private readonly objStms = new Map<number, ObjStm | null>();
+  /** The object streams held in memory, least recently used first, and the bytes they take. */
+  private readonly inMemory = new Set<number>();
+  private inMemoryBytes = 0;
+  /** The temporary file that takes the object streams memory cannot hold, its length, and one handle that reads it. */
+  private pool?: { path: string; size: number; handle: fsp.FileHandle };
+  /** Temporary files of object streams too large for memory. */
+  private objStmFiles: string[] = [];
+  /**
+   * Readers over decoded object streams, so each keeps its blocks between lookups. Readers over a file of their own
+   * hold a file handle each, so fewer of them stay open.
+   */
+  private objStmReaders = new Lru<number, Reader>(256);
+  private objStmFileReaders = new Lru<number, Reader>(8);
+  /** By object stream, the objects whose entries point into it and the index each entry gives. */
+  private wanted?: Map<number, Map<number, number>>;
   /** Object streams found by scan(), indexed once the key exists. */
   private pendingObjStm: number[] = [];
   /** Streams whose indirect /Length or filter entries are being resolved, so a cycle ends after one lap. */
@@ -208,6 +359,12 @@ export class PdfDocument {
   /** Where the objects whose bad tokens are already in issues.malformed were read, so a second read adds nothing. */
   private readonly badTokensCounted = new Set<string>();
   private scanned = false;
+  /** The first trailer any cross-reference section gave, which pdf.js falls back on when its recovery finds none. */
+  private topDict?: PdfDict;
+  /** Set once recovery has looked past what pdf.js finds. */
+  private extended = false;
+  /** What a read of every object of the rebuilt map found, kept until the map is rebuilt again. */
+  private survey?: { root?: PdfDict; objStms: number[]; xrefDict?: PdfDict; catalog?: PdfRef };
   /** Offsets of the xref sections and xref streams that read, which are not ordinary object definitions. */
   readonly structuralOffsets = new Set<number>();
   /** The definitions that older xref sections use and newer ones replaced or freed, as object number then offset. */
@@ -218,6 +375,8 @@ export class PdfDocument {
   /** The extent of the live object insideLiveObject() read last, empty when it does not parse. */
   private lastLive?: { num: number; start: number; end: number };
   private unboundedScanBudget = 0;
+  /** The entries the page lookups found broken or sound, while they run. */
+  private checkedEntries?: Map<string, boolean>;
   /** Bytes parseWindowed() may still read past the next known object. */
   private parseBudget = 0;
 
@@ -251,11 +410,21 @@ export class PdfDocument {
     this.parseBudget = this.size * 4;
     const head = await this.reader.read(0, Math.min(this.size, 1024));
     const h = view(head).indexOf(enc('%PDF-'));
-    if (h < 0) throw new OpenError('not-pdf', 'No PDF header');
-    this.headerOffset = h;
-    const m = /^%PDF-(\d+\.\d+)/.exec(Buffer.from(head.subarray(h, h + 16)).toString('latin1'));
-    if (m) this.headerVersion = m[1];
+    if (h >= 0) {
+      this.headerOffset = h;
+      const m = /^%PDF-(\d+\.\d+)/.exec(Buffer.from(head.subarray(h, h + 16)).toString('latin1'));
+      if (m) this.headerVersion = m[1];
+    } else this.missingHeader = true;
+    try {
+      await this.load();
+    } catch (e) {
+      // pdf.js parses a file without a header all the same. One whose structure does not read either is not a PDF.
+      if (this.missingHeader && e instanceof OpenError) throw new OpenError('not-pdf', `No PDF header, and ${e.message.replace(/^No /, 'no ')}`);
+      throw e;
+    }
+  }
 
+  private async load(): Promise<void> {
     const tailLen = Math.min(this.size, 4096);
     const tail = await this.reader.read(this.size - tailLen, tailLen);
     const eof = view(tail).lastIndexOf(enc('%%EOF'));
@@ -272,7 +441,7 @@ export class PdfDocument {
       if (mm) {
         try {
           await this.loadXrefChain(Number(mm[1]));
-          ok = this.trailer.get('Root') instanceof PdfRef;
+          ok = hasRoot(this.trailer);
         } catch (e) {
           if (e instanceof TimeLimitError || e instanceof ObjectLimitError) throw e;
           ok = false;
@@ -288,23 +457,179 @@ export class PdfDocument {
     await this.initSecurity();
     // Without the key, encrypted object streams are unreadable, and the catalog or page tree may live in one.
     if (this.securityResult && this.securityResult.status !== 'ok') return;
-    await this.indexObjStms();
     this.unboundedScanBudget = this.size * 4;
-    let root = await this.resolve(this.trailer.get('Root'));
-    if (!(root instanceof PdfDict) && !this.scanned) {
-      // The xref chain read, but its catalog did not: rebuild once by scanning.
+    let { root, pages } = await this.catalog();
+    // The xref chain read, but pdf.js would not trust it: rebuild once by scanning. pdf.js does when the catalog or its
+    // page tree does not resolve, and when an entry it reads looking for the first or the last page is broken.
+    if (!this.scanned && (!(root instanceof PdfDict) || !(pages instanceof PdfDict) || (await this.pageEntriesBroken(root, pages)))) {
       this.xref.clear();
-      const trailer = this.trailer;
       await this.scan();
-      if (!(this.trailer.get('Root') instanceof PdfRef)) this.trailer = trailer;
+      await this.initSecurity();
+      if (this.securityResult && this.securityResult.status !== 'ok') return;
+      ({ root, pages } = await this.catalog());
+    }
+    // pdf.js's recovery found no catalog and page tree, and opens nothing. Other readers repair further.
+    if (this.scanned && !this.extended && (!(root instanceof PdfDict) || !(pages instanceof PdfDict))) {
+      await this.scanFurther();
       await this.initSecurity();
       if (this.securityResult && this.securityResult.status !== 'ok') return;
       await this.indexObjStms();
-      root = await this.resolve(this.trailer.get('Root'));
+      ({ root, pages } = await this.catalog());
     }
     if (!(root instanceof PdfDict)) throw new OpenError(this.hasEof ? 'unparseable' : 'truncated', 'No document catalog');
-    const pages = await this.resolve(root.get('Pages'));
     if (!(pages instanceof PdfDict)) throw new OpenError(this.hasEof ? 'unparseable' : 'truncated', 'No page tree');
+    // The walk and the writer reach the catalog by reference, so one written in the trailer gets a number. The trailer
+    // is never encrypted, and neither is a stream written inside it.
+    const direct = this.trailer.get('Root');
+    if (direct instanceof PdfDict) {
+      this.issues.directRoot = true;
+      await this.lift(direct, null, 'trailer');
+      this.trailer.set('Root', new PdfRef(this.addSynthetic('trailer', direct, null), 0));
+    }
+  }
+
+  private async catalog(): Promise<{ root: PdfObject | undefined; pages: PdfObject | undefined }> {
+    const root = await this.resolve(this.trailer.get('Root'));
+    return { root, pages: root instanceof PdfDict ? await this.resolve(root.get('Pages')) : undefined };
+  }
+
+  /**
+   * Whether pdf.js rebuilds the map when it checks the first and the last page, as its checkFirstPage and checkLastPage
+   * do: an entry it reads on the way points at another object. When the last page is not where /Count puts it, pdf.js
+   * reads every page.
+   */
+  private async pageEntriesBroken(root: PdfDict, pages: PdfDict): Promise<boolean> {
+    const top = root.get('Pages');
+    // pdf.js keeps how many pages each node holds from one lookup to the next.
+    const counts = new Map<string, number>();
+    this.checkedEntries = new Map();
+    try {
+      await this.findPage(top, pages, 0, counts);
+      const count = await this.fetch(pages.get('Count'));
+      if (typeof count === 'number' && Number.isInteger(count) && (count <= 1 || (await this.findPage(top, pages, count - 1, counts)))) return false;
+      await this.readAllPages(top, pages);
+      return false;
+    } catch (e) {
+      if (e instanceof BrokenEntry) return true;
+      throw e;
+    } finally {
+      this.checkedEntries = undefined;
+    }
+  }
+
+  /**
+   * Looks for page `index` as pdf.js's getPageDict does, which skips a node whose /Count says the page is not under it.
+   * False where pdf.js fails for another reason, such as a node it already visited.
+   */
+  private async findPage(topRef: PdfObject | undefined, top: PdfDict, index: number, counts: Map<string, number>): Promise<boolean> {
+    // `id` names the object a dictionary was read from, under which pdf.js keeps its /Count.
+    const stack: Array<{ node: PdfObject | undefined; id?: string }> = [{ node: top, id: topRef instanceof PdfRef ? refKey(topRef) : undefined }];
+    const seen = new Set<string>();
+    if (topRef instanceof PdfRef) seen.add(refKey(topRef));
+    let current = 0;
+    for (let steps = 0; steps < MAX_PAGE_STEPS; steps++) {
+      this.checkTime();
+      const item = stack.pop();
+      if (item === undefined) return false;
+      const { node, id } = item;
+      if (node instanceof PdfRef) {
+        const k = refKey(node);
+        const known = counts.get(k);
+        if (known !== undefined && current + known <= index) {
+          current += known;
+          continue;
+        }
+        if (seen.has(k)) return false;
+        seen.add(k);
+        const obj = await this.fetch(node);
+        if (obj instanceof PdfDict && (await this.isPageNode(obj))) {
+          if (!counts.has(k)) counts.set(k, 1);
+          if (current++ === index) return true;
+        } else stack.push({ node: obj, id: k });
+        continue;
+      }
+      if (!(node instanceof PdfDict)) return false;
+      const count = await this.fetch(node.get('Count'));
+      if (typeof count === 'number' && Number.isInteger(count) && count >= 0) {
+        if (id !== undefined && !counts.has(id)) counts.set(id, count);
+        if (current + count <= index) {
+          current += count;
+          continue;
+        }
+      }
+      const kids = await this.fetch(node.get('Kids'));
+      if (Array.isArray(kids)) {
+        steps += kids.length;
+        for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i] });
+      } else if (!(await this.isPageNode(node))) return false;
+      else if (current++ === index) return true;
+    }
+    return false;
+  }
+
+  /** Reads every page as pdf.js's getAllPageDicts does, which stops at the first node it cannot read. */
+  private async readAllPages(topRef: PdfObject | undefined, top: PdfDict): Promise<void> {
+    const queue = [{ node: top, at: 0 }];
+    const seen = new Set<string>();
+    if (topRef instanceof PdfRef) seen.add(refKey(topRef));
+    for (let steps = 0; steps < MAX_PAGE_STEPS; steps++) {
+      this.checkTime();
+      const item = queue.at(-1);
+      if (item === undefined) return;
+      const kids = await this.fetch(item.node.get('Kids'));
+      if (!Array.isArray(kids)) {
+        await this.isPageNode(item.node);
+        return;
+      }
+      if (item.at >= kids.length) {
+        queue.pop();
+        continue;
+      }
+      let kid: PdfObject | undefined = kids[item.at++];
+      if (kid instanceof PdfRef) {
+        if (seen.has(refKey(kid))) return;
+        seen.add(refKey(kid));
+        kid = await this.fetch(kid);
+      }
+      if (!(kid instanceof PdfDict)) return;
+      if (!(await this.isPageNode(kid))) queue.push({ node: kid, at: 0 });
+    }
+  }
+
+  /** A node typed /Page, or any node without /Kids, is a page to pdf.js. */
+  private async isPageNode(d: PdfDict): Promise<boolean> {
+    const type = await this.fetch(d.get('Type'));
+    return (type instanceof PdfName && type.name === 'Page') || !d.has('Kids');
+  }
+
+  /** Reads a value one level deep, as pdf.js reads one on its way to a page. Throws BrokenEntry where pdf.js would. */
+  private async fetch(v: PdfObject | undefined): Promise<PdfObject | undefined> {
+    if (!(v instanceof PdfRef)) return v;
+    let broken = this.checkedEntries?.get(refKey(v));
+    if (broken === undefined) {
+      broken = await this.entryBroken(v);
+      this.checkedEntries?.set(refKey(v), broken);
+    }
+    if (broken) throw new BrokenEntry();
+    return this.getObject(v);
+  }
+
+  /**
+   * Whether an entry points at another object or at nothing that reads as an object header. pdf.js refuses such an
+   * entry, and an entry whose generation differs from the reference, before it reads the object. A missing entry
+   * reads as null instead. An object stream's entry is left out: pdf.js finds the object by its index there.
+   */
+  private async entryBroken(ref: PdfRef): Promise<boolean> {
+    const entry = unpack(this.xref.get(ref.num));
+    if (entry?.type !== 1) return false;
+    if (entry.gen !== ref.gen) return true;
+    try {
+      const head = await this.parseWindowed(this.reader, this.size, entry.offset + this.base, p => p.parseObjectHeader());
+      return head.num !== ref.num || head.gen !== ref.gen;
+    } catch (e) {
+      if (e instanceof ParseError || e instanceof RangeError) return true;
+      throw e;
+    }
   }
 
   private async initSecurity(): Promise<void> {
@@ -347,7 +672,7 @@ export class PdfDocument {
     this.securityResult = r;
     if (r.status === 'ok') this.security = r.handler;
     // Objects and object streams read before the key existed hold ciphertext.
-    this.objCache = objectCache();
+    this.forgetParsed();
     await this.dropObjStms();
   }
 
@@ -379,10 +704,13 @@ export class PdfDocument {
       if (firstTrailer) {
         // pdf.js reads /Root from the newest trailer only, and rebuilds the map by scanning when it is missing.
         this.trailer = section.trailer;
+        this.topDict ??= section.trailer;
         firstTrailer = false;
       } else if (!this.trailer.has('Info') && info !== undefined) this.trailer.set('Info', info);
+      // pdf.js follows a /Prev that is a whole number and stops at any other. One before the start of the file fails
+      // to read here, as in pdf.js and qpdf, and the map is rebuilt by scanning.
       const prev = section.trailer.get('Prev');
-      offset = typeof prev === 'number' && !seen.has(prev) ? prev : undefined;
+      offset = typeof prev === 'number' && Number.isInteger(prev) && !seen.has(prev) ? prev : undefined;
       // Free rows matter only to older sections. Each is held one number at a time, so they may not outnumber the
       // live objects by much: a few bytes of xref stream can free millions of numbers.
       if (offset === undefined) continue;
@@ -398,8 +726,11 @@ export class PdfDocument {
     this.sortedOffsets = undefined;
   }
 
-  /** Reads one section; for hybrid files its XRefStm entries add the objects the table does not give. */
-  private async readXrefSection(offset: number): Promise<XrefSection> {
+  /**
+   * Reads one section; for hybrid files its XRefStm entries add the objects the table does not give. Without `rebase`,
+   * an offset that misses is not tried again past bytes before the header.
+   */
+  private async readXrefSection(offset: number, rebase = true): Promise<XrefSection> {
     const attempt = async (off: number) => {
       const peek = await this.reader.read(off, 16);
       const s = Buffer.from(peek).toString('latin1');
@@ -410,15 +741,16 @@ export class PdfDocument {
     try {
       result = await attempt(offset + this.base);
     } catch (e) {
-      if (this.headerOffset > 0 && this.base === 0) {
+      if (rebase && this.headerOffset > 0 && this.base === 0) {
         this.base = this.headerOffset;
         result = await attempt(offset + this.base);
       } else throw e;
     }
     // Recorded only once the section reads, so an offset that holds something else cannot pass for one.
     this.structuralOffsets.add(result.at);
+    // pdf.js and qpdf read only a whole-number /XRefStm.
     const stm = result.trailer.get('XRefStm');
-    if (typeof stm === 'number') {
+    if (typeof stm === 'number' && Number.isInteger(stm)) {
       try {
         const extra = await this.readXrefStream(stm + this.base);
         this.structuralOffsets.add(extra.at);
@@ -435,8 +767,9 @@ export class PdfDocument {
             if (starts[mid] <= num) lo = mid + 1;
             else hi = mid;
           }
+          // pdf.js keeps the table's free row, and qpdf takes the stream's. Either way the rewrite leaves one reading.
           if (lo > 0 && num < ends[lo - 1]) this.issues.xrefStmOverFree++;
-          result.entries.set(num, e);
+          else result.entries.set(num, e);
         }
       } catch (e) {
         if (e instanceof TimeLimitError || e instanceof ObjectLimitError) throw e;
@@ -477,7 +810,8 @@ export class PdfDocument {
       const t = await token();
       if (t === 'trailer' || t.startsWith('trailer')) {
         const at = pos + i - (t.length - 'trailer'.length);
-        const obj = await this.parseWindowed(this.reader, this.size, at, p => p.parseObject());
+        // pdf.js reads a stream written inside the trailer, as in a catalog written there.
+        const obj = await this.parseWindowed(this.reader, this.size, at, p => p.parseObject(), undefined, undefined, { streams: true });
         if (!(obj instanceof PdfDict)) throw new ParseError('Bad trailer');
         if (repeatsANumber(ranges)) throw new ParseError('xref rows repeat an object number');
         return { entries, free, trailer: obj, at: offset };
@@ -563,6 +897,8 @@ export class PdfDocument {
     let r = 0;
     let k = 0;
     let have = 0;
+    // pdf.js reads none of a Brotli stream that fails at its end, so one is decoded to its end.
+    const whole = filtersOf(obj.dict).some(f => f.name === 'BrotliDecode');
     // Rows are read as the stream decodes, and decoding stops once /Index is filled, so trailing data costs nothing.
     rows: for await (const c of decodeChunks(this.reader.chunks(obj.offset, obj.length), obj.dict, this.opts.decompressedBytes, () => this.checkTime())) {
       this.checkTime();
@@ -571,6 +907,7 @@ export class PdfDocument {
           r += 2;
           k = 0;
         }
+        if (r >= ranges.length && whole) continue rows;
         if (r >= ranges.length) break rows;
         let b: Uint8Array = c;
         let p = i;
@@ -591,7 +928,7 @@ export class PdfDocument {
         const t = field(b, p, w1, 1);
         const off = field(b, p + w1, w2, 0);
         if (t > 2) throw new ParseError('Bad xref stream entry type');
-        if (t === 2) entries.set(num, packStream(off));
+        if (t === 2) entries.set(num, packStream(off, field(b, p + w1 + w2, w3, 0)));
         else if (t === 1) entries.set(num, packOffset(off, field(b, p + w1 + w2, w3, 0)));
         else if (free.length && free[free.length - 1] === num) free[free.length - 1]++;
         else free.push(num, num + 1);
@@ -602,14 +939,376 @@ export class PdfDocument {
     return { entries, free, trailer: obj.dict.clone(), at };
   }
 
-  /** Rebuilds the object map by scanning every byte. Used when the xref is missing or wrong. */
+  /**
+   * Rebuilds the object map by scanning the file, as pdf.js's indexObjects does when the cross-reference data is
+   * missing or wrong, and picks the trailer pdf.js picks.
+   */
   private async scan(): Promise<void> {
     this.rebuilt = true;
     this.scanned = true;
     this.base = 0;
     this.sortedOffsets = undefined;
     this.pendingObjStm = [];
+    this.directLengths = new Map();
+    this.survey = undefined;
     await this.dropObjStms();
+    const { trailers, xrefStms } = await this.indexObjects();
+    this.checkObjectLimit(this.xref.size);
+    await this.readRecovered(xrefStms);
+    this.checkObjectLimit(this.xref.size);
+    // Each candidate is read only up to the next one, so a run of unterminated ones stays linear. Like pdf.js, a
+    // trailer that the end of the file cuts off is read as far as it goes.
+    const dicts: PdfDict[] = [];
+    for (let i = 0; i < trailers.length; i++) {
+      this.checkTime();
+      const at = trailers[i];
+      try {
+        const d = await this.parseWindowed(
+          this.reader,
+          this.size,
+          at,
+          p => {
+            // pdf.js reads the keyword and then one object, which must be a dictionary and not a stream.
+            if (!p.matchKeyword('trailer')) return undefined;
+            const v = p.parseObject();
+            return v instanceof PdfDict && p.streamStart() < 0 ? v : undefined;
+          },
+          i + 1 < trailers.length ? trailers[i + 1] : this.size,
+          undefined,
+          { recover: true, streams: true },
+        );
+        if (d) dicts.push(d);
+      } catch (e) {
+        if (e instanceof TimeLimitError) throw e;
+      }
+    }
+    this.trailer = (await this.pickTrailer(dicts)) ?? this.topDict?.clone() ?? (dicts.length ? undefined : await this.rootHolder()) ?? new PdfDict();
+    this.forgetParsed();
+    await this.dropObjStms();
+  }
+
+  /**
+   * pdf.js's indexObjects. It reads the file token by token, a token running to the next LF, CR or "<", and skips
+   * comments. A token that starts "N G obj" defines an object, and the scan jumps from it to the next "endobj", "N G
+   * obj", "xref" or "trailer<<" and a letter. From "xref" it jumps to "trailer" and then to "startxref", and from
+   * "trailer" to the next "startxref" or "N G obj". So a "trailer" inside an object, a comment or right after
+   * another one is no candidate. Returns the candidates, and the objects that look like xref streams.
+   */
+  private async indexObjects(): Promise<{ trailers: number[]; xrefStms: number[] }> {
+    const size = this.size;
+    const w = new Bytes(this.reader.source, size, () => this.checkTime());
+    const trailers: number[] = [];
+    const xrefStms: number[] = [];
+    // pdf.js compares whole generation numbers, which the packed entries cut to 16 bits.
+    const gens = new Map<number, number>();
+    let pos = 0;
+    while (pos < size) {
+      if (!w.has(pos, 32)) await w.load(pos, 32);
+      const c = w.get(pos);
+      if (c === 0x09 || c === 0x0a || c === 0x0d || c === 0x20) {
+        pos++;
+        continue;
+      }
+      if (c === 0x25) {
+        for (pos++; pos < size; pos++) {
+          if (!w.has(pos, 1)) await w.load(pos, 1);
+          const d = w.get(pos);
+          if (d === 0x0a || d === 0x0d) break;
+        }
+        continue;
+      }
+      // The token never takes the last byte of the file, as pdf.js reads it.
+      let end = pos;
+      for (; end < size - 1; end++) {
+        if (!w.has(end, 1)) await w.load(end, 1);
+        const d = w.get(end);
+        if (d === 0x0a || d === 0x0d || d === 0x3c) break;
+      }
+      if (!w.has(pos, 16)) await w.load(pos, 16);
+      const len = end - pos;
+      if (len >= 4 && w.is(pos, 'xref') && (len === 4 || jsSpace(w.get(pos + 4)))) {
+        pos = await w.find(pos, enc('trailer'));
+        trailers.push(pos);
+        pos = await w.find(pos, enc('startxref'));
+        continue;
+      }
+      if (len >= 7 && w.is(pos, 'trailer') && (len === 7 || jsSpace(w.get(pos + 7)))) {
+        trailers.push(pos);
+        const m = await this.mark(w, end, false);
+        pos = m === undefined ? size : m.obj ? m.start : m.end + 1;
+        continue;
+      }
+      const head = await this.objHead(w, pos, end);
+      if (!head) {
+        pos = end + 1;
+        continue;
+      }
+      if (head.num >= 0) {
+        let update = !this.xref.has(head.num);
+        if (!update && gens.get(head.num) === head.gen) {
+          // pdf.js takes a later definition of the same object unless the file ends inside it.
+          try {
+            await this.quietly(() => this.parseWindowed(this.reader, size, end, p => p.parseObject()));
+            update = true;
+          } catch (e) {
+            if (e instanceof TimeLimitError) throw e;
+            update = !(e instanceof EndOfData);
+          }
+        }
+        if (update) {
+          this.xref.set(head.num, packOffset(pos, head.gen));
+          gens.set(head.num, head.gen);
+          this.checkObjectLimit(this.xref.size);
+        }
+      }
+      const m = await this.mark(w, end, true);
+      const next = m === undefined ? size : m.obj ? m.start : m.end + 1;
+      // pdf.js reads an object as an xref stream when "/XRef" and a byte below "@" come before the jump target.
+      const tag = await w.find(pos, enc('/XRef'), next);
+      if (tag + 5 < next) {
+        if (!w.has(tag + 5, 1)) await w.load(tag + 5, 1);
+        if (w.get(tag + 5) < 64) xrefStms.push(pos);
+      }
+      pos = next;
+    }
+    return { trailers, xrefStms };
+  }
+
+  /** pdf.js's /^(\d+)\s+(\d+)\s+obj\b/ against the token [pos, end): the numbers, or undefined. */
+  private async objHead(w: Bytes, pos: number, end: number): Promise<{ num: number; gen: number } | undefined> {
+    let p = pos;
+    const run = async (test: (c: number) => boolean, keep: boolean): Promise<string | undefined> => {
+      let text = '';
+      const from = p;
+      for (; p < end; p++) {
+        if (!w.has(p, 1)) await w.load(p, 1);
+        const c = w.get(p);
+        if (!test(c)) break;
+        if (keep && text.length < 512) text += String.fromCharCode(c);
+      }
+      return p > from ? text : undefined;
+    };
+    const num = await run(isDigitByte, true);
+    if (num === undefined || (await run(jsSpace, false)) === undefined) return undefined;
+    const gen = await run(isDigitByte, true);
+    if (gen === undefined || (await run(jsSpace, false)) === undefined) return undefined;
+    if (p + 3 > end) return undefined;
+    if (!w.has(p, 4)) await w.load(p, 4);
+    if (!w.is(p, 'obj') || (p + 3 < end && jsWord(w.get(p + 3)))) return undefined;
+    return { num: int32(num), gen: int32(gen) };
+  }
+
+  /**
+   * The first match from `from` on of pdf.js's /\b(endobj|\d+\s+\d+\s+obj|xref|trailer\s*<<)\b/, or with `endobj`
+   * false of /\b(startxref|\d+\s+\d+\s+obj)\b/. The "N G obj" pattern is followed as states, so a long run of digits or
+   * spaces costs one pass: 1 in N, 2 the spaces after it, 3 in G, 4 the spaces after G, 5 digits that cannot start N.
+   */
+  private async mark(w: Bytes, from: number, endobj: boolean): Promise<{ start: number; end: number; obj: boolean } | undefined> {
+    const size = this.size;
+    if (!w.has(from, 32)) await w.load(from, 32);
+    let prev = from > 0 ? w.get(from - 1) : -1;
+    let state = 0;
+    let n = -1;
+    let g = -1;
+    for (let p = from; p < size; p++) {
+      if (!w.has(p, 32)) await w.load(p, 32);
+      const c = w.get(p);
+      if (isDigitByte(c)) {
+        if (state === 2) {
+          state = 3;
+          g = p;
+        } else if (state === 4) {
+          // A third number: the pattern starts again at the second.
+          n = g;
+          g = p;
+          state = 3;
+        } else if (state === 0) {
+          state = jsWord(prev) ? 5 : 1;
+          n = p;
+        }
+      } else if (jsSpace(c)) {
+        if (state === 1) state = 2;
+        else if (state === 3) state = 4;
+        else if (state === 5) state = 0;
+      } else {
+        if (state === 4 && w.is(p, 'obj') && !jsWord(w.get(p + 3))) return { start: n, end: p + 3, obj: true };
+        state = 0;
+        if (!jsWord(prev)) {
+          if (endobj) {
+            if (w.is(p, 'endobj') && !jsWord(w.get(p + 6))) return { start: p, end: p + 6, obj: false };
+            if (w.is(p, 'xref') && !jsWord(w.get(p + 4))) return { start: p, end: p + 4, obj: false };
+            if (w.is(p, 'trailer')) {
+              let q = p + 7;
+              for (; q < size; q++) {
+                if (!w.has(q, 3)) await w.load(q, 3);
+                if (!jsSpace(w.get(q))) break;
+              }
+              if (!w.has(q, 3)) await w.load(q, 3);
+              if (w.is(q, '<<') && jsWord(w.get(q + 2))) return { start: p, end: q + 2, obj: false };
+            }
+          } else if (w.is(p, 'startxref') && !jsWord(w.get(p + 9))) return { start: p, end: p + 9, obj: false };
+        }
+      }
+      prev = c;
+    }
+    return undefined;
+  }
+
+  /**
+   * Reads the xref streams the scan found, and the sections their /Prev chains lead to, as pdf.js does: each fills
+   * only the numbers nothing before it gave, and a free row counts as given.
+   */
+  private async readRecovered(starts: number[]): Promise<void> {
+    // Free rows already merged, as [start, end) runs.
+    const free: number[] = [];
+    const isFree = (num: number) => {
+      for (let i = 0; i < free.length; i += 2) if (num >= free[i] && num < free[i + 1]) return true;
+      return false;
+    };
+    for (const start of starts) {
+      const queue = [start];
+      const seen = new Set<number>();
+      // Sections the chain adds join the queue while it is read.
+      for (const at of queue) {
+        this.checkTime();
+        if (seen.has(at)) continue;
+        seen.add(at);
+        let section: XrefSection;
+        try {
+          section = await this.readXrefSection(at, false);
+        } catch (e) {
+          if (e instanceof TimeLimitError || e instanceof ObjectLimitError) throw e;
+          continue;
+        }
+        for (const [num, entry] of section.entries) if (!this.xref.has(num) && !isFree(num)) this.xref.set(num, entry);
+        // Free runs are few next to the rows, since a few bytes of xref stream can free millions of numbers.
+        if (free.length < 65536) free.push(...section.free.slice(0, 65536));
+        this.topDict ??= section.trailer;
+        const prev = section.trailer.get('Prev');
+        if (typeof prev === 'number' && Number.isInteger(prev)) queue.push(prev);
+        else if (prev instanceof PdfRef) queue.push(prev.num);
+      }
+    }
+  }
+
+  /**
+   * pdf.js's choice among the trailers its recovery finds: the first, in file order, whose /Root and /Pages are
+   * dictionaries, whose /Count is a whole number and that has an /ID, and an /Encrypt if any candidate has one.
+   * Failing that, the last whose /Root and /Pages are dictionaries. A reference whose generation is higher than its
+   * entry's counts in a second pass, once any lookup failed.
+   */
+  private async pickTrailer(dicts: PdfDict[]): Promise<PdfDict | undefined> {
+    const encrypted = dicts.some(d => d.has('Encrypt'));
+    let chosen: PdfDict | undefined;
+    let failed = false;
+    return this.quietly(async () => {
+      for (const fallback of [false, true]) {
+        if (fallback && !failed) break;
+        for (const d of dicts) {
+          let valid: boolean;
+          try {
+            const root = await this.fetchStrict(d.get('Root'), fallback);
+            if (!(root instanceof PdfDict)) continue;
+            const pages = await this.fetchStrict(root.get('Pages'), fallback);
+            if (!(pages instanceof PdfDict)) continue;
+            valid = Number.isInteger(await this.fetchStrict(pages.get('Count'), fallback));
+          } catch (e) {
+            if (!(e instanceof BrokenEntry)) throw e;
+            failed = true;
+            continue;
+          }
+          if (valid && (!encrypted || d.has('Encrypt')) && d.has('ID')) return d;
+          chosen = d;
+        }
+      }
+      return chosen;
+    });
+  }
+
+  /** Reads a value one level deep, throwing BrokenEntry where pdf.js's lookup throws. */
+  private async fetchStrict(v: PdfObject | undefined, fallback: boolean): Promise<PdfObject | undefined> {
+    if (!(v instanceof PdfRef)) return v;
+    const entry = unpack(this.xref.get(v.num));
+    if (!entry) return null;
+    let ref = v;
+    if (entry.type === 1 && entry.gen !== v.gen) {
+      if (!fallback || entry.gen > v.gen) throw new BrokenEntry();
+      ref = new PdfRef(v.num, entry.gen);
+    }
+    if (await this.entryBroken(ref)) throw new BrokenEntry();
+    return this.getObject(ref);
+  }
+
+  /** With no trailer at all, pdf.js takes the lowest-numbered object, or stream dictionary, that holds /Root. */
+  private async rootHolder(): Promise<PdfDict | undefined> {
+    return (await this.surveyObjects()).root?.clone();
+  }
+
+  /**
+   * Reads every object of the rebuilt map once, in number order, for the readings recovery falls back on: the first
+   * that holds /Root, the object streams, the newest xref stream and the earliest catalog in the file.
+   */
+  private async surveyObjects(): Promise<{ root?: PdfDict; objStms: number[]; xrefDict?: PdfDict; catalog?: PdfRef }> {
+    if (this.survey) return this.survey;
+    const found: { root?: PdfDict; objStms: number[]; xrefDict?: PdfDict; catalog?: PdfRef } = { objStms: [] };
+    let xrefAt = -1;
+    let catalogAt = Number.POSITIVE_INFINITY;
+    await this.quietly(async () => {
+      for (const num of Array.from(this.xref.keys()).sort((a, b) => a - b)) {
+        this.checkTime();
+        const entry = unpack(this.xref.get(num));
+        if (entry?.type !== 1) continue;
+        let o: PdfObject;
+        try {
+          o = (await this.parseIndirectAt(entry.offset)).obj;
+        } catch (e) {
+          if (e instanceof TimeLimitError) throw e;
+          continue;
+        }
+        const d = o instanceof PdfStream ? o.dict : o;
+        if (d instanceof PdfDict && d.has('Root')) found.root ??= d;
+        if (o instanceof PdfStream && o.dict.name('Type') === 'ObjStm') found.objStms.push(num);
+        else if (o instanceof PdfStream && o.dict.name('Type') === 'XRef' && entry.offset > xrefAt) {
+          xrefAt = entry.offset;
+          found.xrefDict = o.dict;
+        } else if (o instanceof PdfDict && o.name('Type') === 'Catalog' && entry.offset < catalogAt) {
+          catalogAt = entry.offset;
+          found.catalog = new PdfRef(num, entry.gen);
+        }
+      }
+    });
+    this.survey = found;
+    return found;
+  }
+
+  /** Runs `fn` with the issues as they were before it, for lookups that only decide how to read the file. */
+  private async quietly<T>(fn: () => Promise<T>): Promise<T> {
+    const i = this.issues;
+    const saved = Object.fromEntries(Object.entries(i).map(([k, v]) => [k, v instanceof Set ? new Set(v) : Array.isArray(v) ? [...v] : v]));
+    const counted = new Set(this.badTokensCounted);
+    const wrong = new Set(this.lengthWrongAt);
+    const quiet = this.quiet;
+    this.quiet = true;
+    try {
+      return await fn();
+    } finally {
+      this.quiet = quiet;
+      Object.assign(i, saved);
+      this.badTokensCounted.clear();
+      for (const k of counted) this.badTokensCounted.add(k);
+      this.lengthWrongAt.clear();
+      for (const k of wrong) this.lengthWrongAt.add(k);
+    }
+  }
+
+  /**
+   * Where pdf.js's recovery gives no catalog and page tree, as other readers do: every object is read, the objects in
+   * object streams it finds are added, and a catalog is taken from an xref stream dictionary or a /Type /Catalog.
+   */
+  private async scanFurther(): Promise<void> {
+    this.extended = true;
+    // Any definition after whitespace, ">" or "]", even in a comment, for a number pdf.js's scan did not find, and any
+    // "trailer", newest first, as other readers search for them.
     const trailers = new Set<number>();
     let tail = '';
     const headers = this.objectHeaders((buf, pos) => {
@@ -618,52 +1317,45 @@ export class PdfDocument {
       for (let t = s.indexOf('trailer'); t >= 0; t = s.indexOf('trailer', t + 1)) trailers.add(pos - tail.length + t + 7);
       tail = s.slice(-6);
     });
-    for await (const h of headers) {
-      if (h.before >= 0 && !isWhite(h.before) && h.before !== 0x3e && h.before !== 0x5d) continue;
-      this.xref.set(h.num, packOffset(h.at, h.gen));
-      this.checkObjectLimit(this.xref.size);
+    const more = new Map<number, number>();
+    for await (const h of headers) if (h.before < 0 || isWhite(h.before) || h.before === 0x3e || h.before === 0x5d) more.set(h.num, packOffset(h.at, h.gen));
+    let added = 0;
+    for (const [num, entry] of more) {
+      if (this.xref.has(num)) continue;
+      this.xref.set(num, entry);
+      added++;
     }
-    // Newest first. Each candidate is parsed only up to the next one, so a run of unterminated ones stays linear.
+    this.checkObjectLimit(this.xref.size);
+    if (added) {
+      this.sortedOffsets = undefined;
+      this.survey = undefined;
+    }
+    const { objStms, xrefDict, catalog } = await this.surveyObjects();
+    this.pendingObjStm = [...objStms];
     const cands = Array.from(trailers).sort((a, b) => a - b);
-    for (let i = cands.length - 1; i >= 0; i--) {
+    let found: PdfDict | undefined;
+    for (let i = cands.length - 1; i >= 0 && !found; i--) {
       this.checkTime();
       try {
-        const d = await this.parseWindowed(this.reader, this.size, cands[i], p => p.parseObject(), i + 1 < cands.length ? cands[i + 1] - 7 : this.size);
-        if (d instanceof PdfDict && d.get('Root') instanceof PdfRef) {
-          this.trailer = d;
-          break;
-        }
+        const d = await this.parseWindowed(this.reader, this.size, cands[i], p => p.parseObject(), i + 1 < cands.length ? cands[i + 1] - 7 : this.size, undefined, {
+          recover: true,
+          streams: true,
+        });
+        if (d instanceof PdfDict && hasRoot(d)) found = d;
       } catch (e) {
         if (e instanceof TimeLimitError) throw e;
       }
     }
-    // Object streams, and the newest xref stream and the first catalog in case no trailer was found.
-    let xrefAt = -1;
-    let xrefDict: PdfDict | undefined;
-    let catalog: PdfRef | undefined;
-    for (const num of Array.from(this.xref.keys())) {
-      this.checkTime();
-      const entry = unpack(this.xref.get(num));
-      if (entry?.type !== 1) continue;
-      let o: PdfObject;
-      try {
-        o = (await this.parseIndirectAt(entry.offset)).obj;
-      } catch (e) {
-        if (e instanceof TimeLimitError) throw e;
-        continue;
-      }
-      if (o instanceof PdfStream && o.dict.name('Type') === 'ObjStm') this.pendingObjStm.push(num);
-      else if (o instanceof PdfStream && o.dict.name('Type') === 'XRef' && entry.offset > xrefAt) {
-        xrefAt = entry.offset;
-        xrefDict = o.dict;
-      } else if (o instanceof PdfDict && o.name('Type') === 'Catalog') catalog ??= new PdfRef(num, entry.gen);
-    }
-    if (!(this.trailer.get('Root') instanceof PdfRef)) {
+    if (found) this.trailer = found;
+    else if (xrefDict?.has('Root')) {
       // The xref stream dictionary also carries /Encrypt and /ID, which a catalog alone would lose.
-      if (xrefDict) this.trailer = xrefDict.clone();
-      if (!(this.trailer.get('Root') instanceof PdfRef) && catalog) this.trailer.set('Root', catalog);
+      this.trailer = xrefDict.clone();
+    } else if (catalog) {
+      this.trailer = this.trailer.clone();
+      this.trailer.set('Root', catalog);
     }
-    this.objCache = objectCache();
+    this.forgetParsed();
+    await this.dropObjStms();
   }
 
   /** Adds the objects held in the object streams scan() found. Their bodies may be encrypted, so this runs after initSecurity(). */
@@ -672,18 +1364,33 @@ export class PdfDocument {
     this.pendingObjStm = [];
     for (const num of nums) {
       this.checkTime();
-      let stm: ObjStmData | undefined;
+      let stm: ObjStm | null = null;
       try {
-        stm = await this.loadObjStm(num);
+        stm = await this.loadObjStm(num, true);
       } catch (e) {
         if (e instanceof DecompressionLimitError || e instanceof TimeLimitError) throw e;
-        continue; // a broken object stream adds nothing
       }
-      if (!stm) continue;
-      for (const on of stm.offsets.keys()) if (!this.xref.has(on)) this.xref.set(on, packStream(num));
-      await stm.reader.source.close?.();
+      // A broken object stream adds nothing.
+      if (stm) for (const [on, index] of stm.byNum) if (!this.xref.has(on) && !(stm.badFrom !== undefined && index >= stm.badFrom)) this.xref.set(on, packStream(num, index));
+      await this.dropObjStms();
       this.checkObjectLimit(this.xref.size);
     }
+    // A /Length read before these objects had entries read as nothing.
+    if (nums.length) this.forgetParsed();
+  }
+
+  /**
+   * Forgets parsed objects, the stream lengths read for them and the streams lifted out of them, once the map or the
+   * key changes. Only the catalog written in the trailer, lifted once the map is final, outlives this.
+   */
+  private forgetParsed(): void {
+    this.objCache = objectCache();
+    this.directLengths = new Map();
+    this.synthetic.clear();
+    this.syntheticAt.clear();
+    this.heldBodies.clear();
+    this.syntheticCost.clear();
+    this.syntheticTotal = 0;
   }
 
   // ---------- objects ----------
@@ -692,96 +1399,58 @@ export class PdfDocument {
    * Parses the indirect object ("N G obj ...") at a source offset. `at` is where its header starts, past any
    * whitespace, and `end` where its value or its stream body ends.
    */
-  private parseIndirectAt(offset: number): Promise<{ ref: PdfRef; obj: PdfObject; at: number; end: number; cost: number }> {
+  private parseIndirectAt(offset: number): Promise<{ ref: PdfRef; obj: PdfObject; at: number; end: number; cost: number; directCost: number }> {
     return this.parseWindowed(
       this.reader,
       this.size,
       offset,
-      async p => {
+      async (p, at) => {
         p.skipWhitespace();
-        const at = offset + p.pos;
+        const head = at(p.pos);
         const ref = p.parseObjectHeader();
         const obj = p.parseObject();
+        const { directCost } = p;
         if (obj instanceof PdfDict) {
           const start = p.streamStart();
           if (start >= 0) {
-            const s = await this.locateStream(obj, offset + start, ref);
-            return { ref, obj: s, at, end: s.offset + s.length, cost: p.cost };
+            const s = await this.locateStream(obj, at(start), ref);
+            return { ref, obj: s, at: head, end: s.offset + s.length, cost: p.cost, directCost };
           }
         }
-        return { ref, obj, at, end: offset + p.pos, cost: p.cost };
+        return { ref, obj, at: head, end: at(p.pos - 1) + 1, cost: p.cost, directCost };
       },
       this.nextOffsetAfter(offset),
+      undefined,
+      { streams: true },
     );
   }
 
   /** Finds a stream body's true length, trusting /Length only when "endstream" follows it. */
   private async locateStream(dict: PdfDict, bodyStart: number, ref: PdfRef): Promise<PdfStream> {
+    // pdf.js trusts only a whole-number /Length. A fractional one would read part of a byte.
     let declared: number | undefined;
     const L = dict.get('Length');
-    if (typeof L === 'number') declared = L;
+    if (typeof L === 'number' && Number.isInteger(L)) declared = L;
     else if (L instanceof PdfRef && L.num !== ref.num && !this.lengthResolving.has(ref.num)) {
       this.lengthResolving.add(ref.num);
       try {
         const v = await this.getObject(L);
-        if (typeof v === 'number') declared = v;
+        if (typeof v === 'number' && Number.isInteger(v)) declared = v;
       } catch {
         /* fall back to scanning */
       } finally {
         this.lengthResolving.delete(ref.num);
       }
     }
-    // Outside xref streams the filter entries may be indirect. They are resolved one level, as viewers do, so every
-    // reader of this dictionary decodes what a viewer decodes. A reference to a stream or to nothing stays in place.
-    if (!this.lengthResolving.has(ref.num)) {
-      this.lengthResolving.add(ref.num);
-      const named: number[] = [];
-      try {
-        const direct = async (v: PdfObject): Promise<PdfObject> => {
-          if (!(v instanceof PdfRef) || this.lengthResolving.has(v.num)) return v;
-          const o = await this.getObject(v);
-          if (o === null || o instanceof PdfStream) return v;
-          named.push(v.num);
-          return o;
-        };
-        for (const key of ['Filter', 'DecodeParms', 'DP']) {
-          const v = dict.get(key);
-          if (v === undefined) continue;
-          const r = await direct(v);
-          if (!Array.isArray(r)) dict.set(key, r);
-          else {
-            const items: PdfObject[] = [];
-            for (const x of r) items.push(await direct(x));
-            dict.set(key, items);
-          }
-        }
-        // pdf.js and qpdf also resolve the values inside a parameter dictionary, such as an indirect /Predictor.
-        for (const key of ['DecodeParms', 'DP']) {
-          const v = dict.get(key);
-          const list = Array.isArray(v) ? v : [v];
-          for (let i = 0; i < list.length; i++) {
-            const d = list[i];
-            if (!(d instanceof PdfDict) || !d.entries().some(([, x]) => x instanceof PdfRef)) continue;
-            const c = d.clone();
-            for (const [k, x] of c.entries()) c.set(k, await direct(x));
-            if (Array.isArray(v)) v[i] = c;
-            else dict.set(key, c);
-          }
-        }
-      } finally {
-        this.lengthResolving.delete(ref.num);
-      }
-      if (named.length) this.filterRefs.set(ref.num, named);
-      else this.filterRefs.delete(ref.num);
-    }
+    await this.resolveFilters(dict, ref.num);
     if (declared !== undefined && declared >= 0 && bodyStart + declared <= this.size) {
       const after = await this.reader.read(bodyStart + declared, 32);
       const s = Buffer.from(after).toString('latin1');
       if (/^\s*endstream/.test(s)) return new PdfStream(dict, bodyStart, declared);
     }
     // Scan for "endstream", first only up to the next object's offset, which keeps total work linear.
-    if (!this.quiet && !this.lengthWrongAt.has(bodyStart)) {
-      this.lengthWrongAt.add(bodyStart);
+    if (!this.quiet && !this.lengthWrongAt.has(String(bodyStart))) {
+      this.lengthWrongAt.add(String(bodyStart));
       this.issues.streamLengthWrong++;
     }
     const bound = this.nextOffsetAfter(bodyStart);
@@ -794,21 +1463,67 @@ export class PdfDocument {
     return new PdfStream(dict, bodyStart, Math.max(0, bound - bodyStart));
   }
 
-  /** Position just before the EOL that precedes "endstream" in [from, to), or -1. */
+  /**
+   * Outside xref streams the filter entries may be indirect. They are resolved one level, as viewers do, so every
+   * reader of this dictionary decodes what a viewer decodes. A reference to a stream or to nothing stays in place.
+   */
+  private async resolveFilters(dict: PdfDict, num: number): Promise<void> {
+    if (this.lengthResolving.has(num)) return;
+    this.lengthResolving.add(num);
+    const named: number[] = [];
+    try {
+      const direct = async (v: PdfObject): Promise<PdfObject> => {
+        if (!(v instanceof PdfRef) || this.lengthResolving.has(v.num)) return v;
+        const o = await this.getObject(v);
+        if (o === null || o instanceof PdfStream) return v;
+        named.push(v.num);
+        return o;
+      };
+      for (const key of ['Filter', 'DecodeParms', 'DP']) {
+        const v = dict.get(key);
+        if (v === undefined) continue;
+        const r = await direct(v);
+        if (!Array.isArray(r)) dict.set(key, r);
+        else {
+          const items: PdfObject[] = [];
+          for (const x of r) items.push(await direct(x));
+          dict.set(key, items);
+        }
+      }
+      // pdf.js and qpdf also resolve the values inside a parameter dictionary, such as an indirect /Predictor.
+      for (const key of ['DecodeParms', 'DP']) {
+        const v = dict.get(key);
+        const list = Array.isArray(v) ? v : [v];
+        for (let i = 0; i < list.length; i++) {
+          const d = list[i];
+          if (!(d instanceof PdfDict) || !d.entries().some(([, x]) => x instanceof PdfRef)) continue;
+          const c = d.clone();
+          for (const [k, x] of c.entries()) c.set(k, await direct(x));
+          if (Array.isArray(v)) v[i] = c;
+          else dict.set(key, c);
+        }
+      }
+    } finally {
+      this.lengthResolving.delete(num);
+    }
+    if (named.length) this.filterRefs.set(num, named);
+    else this.filterRefs.delete(num);
+  }
+
+  /** Position just before the EOL that precedes "endstream", or a misspelling pdf.js takes, in [from, to), or -1. */
   private async findEndstream(from: number, to: number, unbounded: boolean): Promise<number> {
-    const needle = enc('endstream');
     let pos = from;
     const chunk = 1 << 20;
     while (pos < to) {
       this.checkTime();
-      const n = Math.min(chunk + needle.length, to + needle.length - pos, this.size - pos);
+      const n = Math.min(chunk + ENDSTREAM.length, to + ENDSTREAM.length - pos, this.size - pos);
       if (n <= 0) break;
       const buf = await this.reader.source.read(pos, n);
       if (unbounded) {
         this.unboundedScanBudget -= buf.length;
         if (this.unboundedScanBudget < 0) return -1;
       }
-      const k = view(buf).indexOf(needle);
+      const k = endstreamIn(buf, 0)?.at ?? -1;
       if (k >= 0) {
         let end = pos + k;
         const back = await this.reader.read(Math.max(from, end - 2), Math.min(2, end - from));
@@ -843,6 +1558,8 @@ export class PdfDocument {
 
   /** Loads an object by reference, decrypted. Missing and free objects are null. */
   async getObject(ref: PdfRef, raw = false): Promise<PdfObject> {
+    const made = this.synthetic.get(ref.num);
+    if (made !== undefined) return made.obj;
     const entry = unpack(this.xref.get(ref.num));
     // pdf.js refuses a reference whose generation differs from the entry. This one is read all the same, and reported.
     if (entry?.type === 1 && entry.gen !== ref.gen && !this.quiet) this.issues.refGen.add(ref.num);
@@ -852,10 +1569,11 @@ export class PdfDocument {
     let obj: PdfObject;
     let cost: number;
     if (entry.type === 1) {
-      let parsed: { ref: PdfRef; obj: PdfObject; cost: number };
+      let parsed: { ref: PdfRef; obj: PdfObject; cost: number; directCost: number };
       try {
         parsed = await this.parseIndirectAt(entry.offset + this.base);
         if (parsed.ref.num !== ref.num) throw new ParseError('Object number mismatch');
+        if (parsed.directCost) this.chargeSynthetic(String(ref.num), parsed.directCost);
       } catch (e) {
         if (e instanceof ParseError || e instanceof RangeError) {
           // A bad entry costs only this object; rebuilding the whole map could bring back older revisions.
@@ -868,9 +1586,12 @@ export class PdfDocument {
       if (parsed.ref.gen !== entry.gen) this.issues.genMismatch++;
       obj = parsed.obj;
       cost = parsed.cost;
-      if (this.security && !raw && !(this.encryptRef && this.encryptRef.num === ref.num)) obj = this.decryptObject(obj, ref.num, entry.gen);
+      const decrypt = this.security !== undefined && !raw && !(this.encryptRef && this.encryptRef.num === ref.num);
+      if (decrypt) obj = this.decryptObject(obj, ref.num, entry.gen);
+      // pdf.js decrypts a stream written inside an object with that object's key.
+      if (parsed.directCost) await this.lift(obj, decrypt ? { num: ref.num, gen: entry.gen } : null, String(ref.num));
     } else {
-      ({ obj, cost } = await this.getFromObjStm(entry.stream, ref.num));
+      ({ obj, cost } = await this.getFromObjStm(entry.stream, ref.num, entry.index));
     }
     if (!raw) this.objCache.set(ref.num, obj, cost);
     return obj;
@@ -896,47 +1617,230 @@ export class PdfDocument {
     return walk(obj);
   }
 
-  private async getFromObjStm(stmNum: number, num: number): Promise<{ obj: PdfObject; cost: number }> {
-    let stm = this.objStmCache.get(stmNum);
-    if (!stm) {
-      const kept = this.spilledObjStm.get(stmNum);
-      try {
-        stm = kept ? { ...kept, reader: new Reader(kept.source, kept.size, 65536, 4) } : await this.loadObjStm(stmNum);
-      } catch (e) {
-        if (e instanceof DecompressionLimitError || e instanceof TimeLimitError) throw e;
-        stm = undefined;
+  /**
+   * Gives each stream written inside `obj` a synthetic number and puts a reference to it in its place, so the walk
+   * and the writer meet it as they meet any stream. `key` names the object whose key decrypts it. `owner` names
+   * where `obj` came from, so a second read of it reuses the numbers. `stm` names the object stream whose decoded
+   * data holds the bodies, when `obj` sits in one.
+   */
+  private async lift(obj: PdfObject, key: { num: number; gen: number } | null, owner: string, stm?: number): Promise<void> {
+    const stack: Array<PdfDict | PdfObject[]> = [];
+    const push = (v: PdfObject) => {
+      if (v instanceof PdfDict || Array.isArray(v)) stack.push(v);
+      else if (v instanceof PdfStream) stack.push(v.dict);
+    };
+    push(obj);
+    for (let list = stack.pop(); list !== undefined; list = stack.pop()) {
+      const slots: Array<[string | number, PdfObject]> = Array.isArray(list) ? list.map((v, i): [number, PdfObject] => [i, v]) : list.entries();
+      for (const [k, v] of slots) {
+        push(v);
+        if (!(v instanceof PdfStream)) continue;
+        const at = `${owner} ${v.offset}`;
+        const num = this.addSynthetic(at, v, key);
+        if (stm !== undefined) this.heldBodies.set(num, { stm, offset: v.offset, length: v.length });
+        await this.resolveFilters(v.dict, num);
+        if (!this.quiet) {
+          this.issues.directStreams.add(at);
+          const L = v.dict.get('Length');
+          const declared = typeof L === 'number' ? L : L instanceof PdfRef ? this.directLengths.get(L.num) : undefined;
+          if (declared !== v.length && !this.lengthWrongAt.has(at)) {
+            this.lengthWrongAt.add(at);
+            this.issues.streamLengthWrong++;
+          }
+        }
+        const ref = new PdfRef(num, 0);
+        if (Array.isArray(list)) list[k as number] = ref;
+        else list.set(k as string, ref);
       }
-      if (!stm) {
-        this.issues.malformed++;
-        return { obj: null, cost: 0 };
-      }
-      // An evicted spilled stream gives up its file handle; it reopens from spilledObjStm when needed again.
-      await this.objStmCache.set(stmNum, stm)?.reader.source.close?.();
     }
-    const off = stm.offsets.get(num);
-    if (off === undefined) return { obj: null, cost: 0 };
+  }
+
+  /** Numbers an object that has no entry of its own, the same number each time the same object is read. */
+  private addSynthetic(at: string, obj: PdfObject, key: { num: number; gen: number } | null): number {
+    let num = this.syntheticAt.get(at);
+    if (num === undefined) {
+      num = this.nextSynthetic--;
+      this.syntheticAt.set(at, num);
+    }
+    this.synthetic.set(num, { obj, key });
+    return num;
+  }
+
+  /** Records what the streams inside the object `owner` hold. Throws ParseError when that would pass the budget. */
+  private chargeSynthetic(owner: string, cost: number): void {
+    const total = this.syntheticTotal - (this.syntheticCost.get(owner) ?? 0) + cost;
+    if (total > MAX_SYNTHETIC_COST) throw new ParseError('Streams written inside objects hold too much');
+    this.syntheticTotal = total;
+    this.syntheticCost.set(owner, cost);
+  }
+
+  /** The object whose key decrypts a stream: the stream's own, or for a synthetic one the object that held it. */
+  private keyOf(num: number): { num: number; gen: number } | null {
+    const made = this.synthetic.get(num);
+    return made !== undefined ? made.key : { num, gen: this.genOf(num) };
+  }
+
+  /**
+   * Reads object `num` from object stream `stmNum`. pdf.js finds an object by the number the stream's header gives it,
+   * and by `index`, the index its entry gives, when the header does not name it. Each object ends where the next one
+   * starts, and the last at the end of the stream, as pdf.js reads them.
+   */
+  private async getFromObjStm(stmNum: number, num: number, index: number): Promise<{ obj: PdfObject; cost: number }> {
+    const stm = await this.objStm(stmNum);
+    if (!stm) {
+      this.issues.malformed++;
+      return { obj: null, cost: 0 };
+    }
+    const i = stm.byNum.get(num) ?? index;
+    const off = stm.offsets.get(i);
+    if (off === undefined || (stm.badFrom !== undefined && i >= stm.badFrom)) return { obj: null, cost: 0 };
+    let end = stm.size;
+    const next = stm.offsets.get(i + 1);
+    if (next !== undefined) {
+      // pdf.js reads no object whose next one does not start after it. The header was reported already.
+      if (next <= off) return { obj: null, cost: 0 };
+      end = Math.min(stm.size, stm.first + next);
+    }
     try {
-      return await this.parseWindowed(stm.reader, stm.size, stm.first + off, p => ({ obj: p.parseObject(), cost: p.cost }), stm.size, `${stmNum} ${off}`);
+      const { obj, cost, directCost } = await this.parseWindowed(
+        this.objStmReader(stmNum, stm),
+        stm.size,
+        stm.first + off,
+        p => ({ obj: p.parseObject(), cost: p.cost, directCost: p.directCost }),
+        end,
+        `${stmNum} ${off}`,
+        { streams: true, hard: true, topStream: true },
+      );
+      if (directCost) {
+        // pdf.js reads a stream stored in an object stream, or written inside an object there, from the decoded data,
+        // with no key of its own. The body stays where it is, since the decoded data stays until the run ends.
+        this.chargeSynthetic(String(num), directCost);
+        if (obj instanceof PdfStream) {
+          this.heldBodies.set(num, { stm: stmNum, offset: obj.offset, length: obj.length });
+          if (!this.quiet) this.issues.objStmStreams.add(num);
+        }
+        await this.lift(obj, null, String(num), stmNum);
+      }
+      return { obj, cost };
     } catch (e) {
-      if (e instanceof TimeLimitError) throw e;
+      if (e instanceof TimeLimitError || e instanceof DecompressionLimitError || e instanceof ObjectLimitError) throw e;
       this.issues.malformed++;
       return { obj: null, cost: 0 };
     }
   }
 
-  /** Decodes an object stream in chunks; large ones go to a temporary file instead of memory. */
-  private async loadObjStm(stmNum: number): Promise<ObjStmData | undefined> {
-    const entry = unpack(this.xref.get(stmNum));
-    if (entry?.type !== 1) return undefined;
-    const { obj } = await this.parseIndirectAt(entry.offset + this.base);
-    if (!(obj instanceof PdfStream) || obj.dict.name('Type') !== 'ObjStm') return undefined;
-    const threshold = this.opts.memoryThreshold ?? 8 * 1024 * 1024;
-    let temp = this.opts.temp;
-    if (temp === undefined) {
-      this.ownTemp ??= new TempDir();
-      temp = this.ownTemp;
+  /** The decoded object stream `stmNum`, decoded on first use, or null when it does not read. */
+  private async objStm(stmNum: number): Promise<ObjStm | null> {
+    const known = this.objStms.get(stmNum);
+    if (known !== undefined) {
+      if (known?.mem && this.inMemory.delete(stmNum)) this.inMemory.add(stmNum);
+      return known;
     }
-    const sink = new SpillSink(temp, threshold);
+    let stm: ObjStm | null = null;
+    try {
+      stm = await this.loadObjStm(stmNum);
+    } catch (e) {
+      if (e instanceof DecompressionLimitError || e instanceof TimeLimitError) throw e;
+    }
+    this.objStms.set(stmNum, stm);
+    if (stm?.mem) await this.holdInMemory(stmNum, stm.mem.length);
+    return stm;
+  }
+
+  /** Counts a decoded object stream against memoryThreshold, and moves the least recently used ones out past it. */
+  private async holdInMemory(stmNum: number, size: number): Promise<void> {
+    this.inMemory.add(stmNum);
+    this.inMemoryBytes += size;
+    const threshold = this.opts.memoryThreshold ?? 8 * 1024 * 1024;
+    for (const old of this.inMemory) {
+      if (this.inMemoryBytes <= threshold) break;
+      if (old === stmNum) continue;
+      const o = this.objStms.get(old);
+      const mem = o?.mem;
+      this.inMemory.delete(old);
+      if (!o || !mem) continue;
+      const temp = this.tempDir();
+      try {
+        if (!this.pool) {
+          const path = await temp.file('.objstm');
+          this.pool = { path, size: 0, handle: await fsp.open(path, 'a+') };
+          this.issues.memoryFallback.push('Decoded object streams');
+        }
+        for (let done = 0; done < mem.length; ) done += (await this.pool.handle.write(mem, done, mem.length - done)).bytesWritten;
+      } catch (e) {
+        temp.ioError ??= e;
+        throw e;
+      }
+      o.pooled = this.pool.size;
+      this.pool.size += mem.length;
+      o.mem = undefined;
+      this.inMemoryBytes -= mem.length;
+      this.objStmReaders.delete(old);
+    }
+  }
+
+  private tempDir(): TempDir {
+    if (this.opts.temp) return this.opts.temp;
+    this.ownTemp ??= new TempDir();
+    return this.ownTemp;
+  }
+
+  /** A reader over a decoded object stream. Only a few stay open, so a file handle is given up when its reader goes. */
+  private objStmReader(stmNum: number, stm: ObjStm): Reader {
+    const own = stm.path !== undefined;
+    const readers = own ? this.objStmFileReaders : this.objStmReaders;
+    const kept = readers.get(stmNum);
+    if (kept) return kept;
+    let source: ByteSource;
+    if (stm.mem) source = bufferSource(stm.mem);
+    else if (stm.pooled !== undefined && this.pool) {
+      const { handle } = this.pool;
+      const at = stm.pooled;
+      const temp = this.tempDir();
+      source = {
+        size: async () => stm.size,
+        read: async (offset, length) => {
+          if (!Number.isSafeInteger(offset) || offset < 0 || offset >= stm.size || !(length >= 1)) return new Uint8Array(0);
+          const n = Math.min(Math.floor(length), stm.size - offset);
+          const buf = Buffer.allocUnsafe(n);
+          try {
+            for (let done = 0; done < n; ) {
+              const { bytesRead } = await handle.read(buf, done, n - done, at + offset + done);
+              if (bytesRead === 0) throw Object.assign(new Error(`The temporary file of object streams ends at ${at + offset + done}`), { code: 'EIO' });
+              done += bytesRead;
+            }
+          } catch (e) {
+            temp.ioError ??= e;
+            throw e;
+          }
+          return buf;
+        },
+      };
+    } else if (stm.path !== undefined) source = this.tempDir().watch(fileSource(stm.path));
+    else throw new Error(`Object stream ${stmNum} has no data`);
+    // Objects are small, so the pooled ones read in small blocks.
+    const reader = stm.mem ? new Reader(source, stm.size, 65536, 64) : stm.pooled !== undefined ? new Reader(source, stm.size, 4096, 4) : new Reader(source, stm.size, 65536, 4);
+    const out = readers.set(stmNum, reader);
+    // A reader pushed out gives up its file handle. It closes after the current read, which this one may still be.
+    if (out) void out.source.close?.()?.catch(() => undefined);
+    return reader;
+  }
+
+  /**
+   * Decodes an object stream in chunks; one larger than memoryThreshold goes to a temporary file. Of its header it
+   * keeps the pairs that the entries pointing into it can reach, or with `all` every pair, for indexing it.
+   */
+  private async loadObjStm(stmNum: number, all = false): Promise<ObjStm | null> {
+    const entry = unpack(this.xref.get(stmNum));
+    if (entry?.type !== 1) return null;
+    const { obj } = await this.parseIndirectAt(entry.offset + this.base);
+    if (!(obj instanceof PdfStream)) return null;
+    // pdf.js reads any stream an entry names as an object stream, once /N and /First are whole numbers.
+    if (obj.dict.name('Type') !== 'ObjStm') {
+      if (!Number.isInteger(obj.dict.get('N')) || !Number.isInteger(obj.dict.get('First'))) return null;
+      this.issues.objStmType.add(stmNum);
+    }
+    const sink = new SpillSink(this.tempDir(), this.opts.memoryThreshold ?? 8 * 1024 * 1024);
     try {
       for await (const c of decodeChunks(this.plainChunks(obj, stmNum), obj.dict, this.opts.decompressedBytes, () => this.checkTime())) await sink.write(c);
     } finally {
@@ -944,81 +1848,189 @@ export class PdfDocument {
     }
     const source = sink.source();
     const size = await source.size();
-    const reader = new Reader(source, size, 65536, sink.spilled ? 4 : 64);
     const n = Math.min(obj.dict.number('N') ?? 0, 10_000_000);
     const first = obj.dict.number('First') ?? 0;
-    // pdf.js reads no object of a stream whose header it cannot follow: these entries, then each offset in turn.
-    if (!Number.isInteger(obj.dict.get('N')) || !Number.isInteger(obj.dict.get('First'))) this.issues.badObjStm.add(stmNum);
-    const offsets = new Map<number, number>();
+    const stm: ObjStm = { size, first, byNum: new Map(), offsets: new Map(), pairs: 0 };
+    // pdf.js reads no object of a stream whose header it cannot follow: these entries, then each pair in turn.
+    if (!Number.isInteger(obj.dict.get('N')) || !Number.isInteger(obj.dict.get('First')) || n < 0) {
+      this.issues.badObjStm.add(stmNum);
+      stm.badFrom = 0;
+    }
     if (sink.spilled) {
-      // Recorded before the header is read, so release() closes and deletes the file even if that read fails.
+      // Recorded before the header is read, so release() deletes the file even if that read fails.
       const spillPath = sink.path;
       if (spillPath === undefined) throw new Error(`Object stream ${stmNum} spilled without a file`);
-      this.spilledObjStm.set(stmNum, { path: spillPath, source, size, offsets, first });
+      this.objStmFiles.push(spillPath);
+      stm.path = spillPath;
       const part = `Object stream ${stmNum}`;
       if (!this.issues.memoryFallback.includes(part)) this.issues.memoryFallback.push(part);
-    }
-    // The header pairs are read in bounded windows: /First is untrusted and can claim the whole decoded stream.
-    const end = Math.min(size, Math.max(first, 0));
-    let win = 65536;
-    let last = -1;
-    for (let pos = 0, k = 0; k < n && pos < end; ) {
-      this.checkTime();
-      const buf = await reader.read(pos, Math.min(win, end - pos));
-      const hp = new Parser(buf, 0, pos + buf.length >= end);
-      let consumed = 0;
-      try {
-        for (; k < n; k++) {
-          const on = hp.parseObject();
-          const off = hp.parseObject();
-          if (typeof on === 'number' && typeof off === 'number') offsets.set(on, off);
-          if (typeof off !== 'number' || !Number.isInteger(on) || !Number.isInteger(off) || off <= last) this.issues.badObjStm.add(stmNum);
-          else last = off;
-          consumed = hp.pos;
+    } else stm.mem = await source.read(0, size);
+    // The pairs a lookup can reach: those naming an object whose entry points here, and the index each entry gives.
+    const wanted = all ? undefined : this.wantedIn(stmNum);
+    const reach = new Set<number>();
+    if (wanted) for (const index of wanted.values()) reach.add(index).add(index + 1);
+    const reader = new Reader(source, size, 65536, sink.spilled ? 4 : 64);
+    try {
+      // pdf.js reads /N pairs from the start of the data, wherever /First puts the objects. They are read here in
+      // bounded windows.
+      let win = 65536;
+      let last = -1;
+      let prev: number | undefined;
+      for (let pos = 0, k = 0; k < n && pos < size && stm.badFrom !== 0; ) {
+        this.checkTime();
+        const buf = await reader.read(pos, Math.min(win, size - pos));
+        const hp = new Parser(buf, 0, pos + buf.length >= size);
+        let consumed = 0;
+        try {
+          for (; k < n; k++) {
+            const on = hp.parseObject();
+            const off = hp.parseObject();
+            if (typeof on === 'number' && typeof off === 'number') {
+              if (wanted === undefined || wanted.has(on)) {
+                stm.byNum.set(on, k);
+                reach.add(k + 1);
+              }
+              if (wanted === undefined || reach.has(k) || stm.byNum.get(on) === k) stm.offsets.set(k, off);
+            }
+            if (typeof off !== 'number' || !Number.isInteger(on) || !Number.isInteger(off)) {
+              this.issues.badObjStm.add(stmNum);
+              stm.badFrom = 0;
+              break;
+            }
+            if (off <= last) this.issues.badObjStm.add(stmNum);
+            else last = off;
+            if (prev !== undefined && off < prev) stm.badFrom ??= k - 1;
+            prev = off;
+            consumed = hp.pos;
+            stm.pairs = k + 1;
+          }
+        } catch (e) {
+          if (!(e instanceof NeedMoreData)) break;
         }
-      } catch (e) {
-        // A short or damaged header still yields the pairs read so far.
-        if (!(e instanceof NeedMoreData)) break;
+        if (consumed > 0) {
+          pos += consumed;
+          win = 65536;
+        } else {
+          win *= 4;
+          if (win > 1 << 20) break;
+        }
       }
-      if (consumed > 0) {
-        pos += consumed;
-        win = 65536;
-      } else {
-        win *= 4;
-        if (win > 1 << 20) break;
+      // A header with fewer than /N pairs that pdf.js can read leaves pdf.js no object at all.
+      if (stm.pairs < n) {
+        this.issues.badObjStm.add(stmNum);
+        stm.badFrom = 0;
       }
+    } finally {
+      await source.close?.();
     }
-    return { reader, size, offsets, first };
+    return stm;
+  }
+
+  /** The objects whose entries point into object stream `stmNum`, with the index each entry gives. */
+  private wantedIn(stmNum: number): Map<number, number> {
+    if (!this.wanted) {
+      const wanted = new Map<number, Map<number, number>>();
+      for (const [num, v] of this.xref) {
+        const e = unpack(v);
+        if (e?.type !== 2) continue;
+        const m = wanted.get(e.stream) ?? new Map<number, number>();
+        wanted.set(e.stream, m);
+        m.set(num, e.index);
+      }
+      this.wanted = wanted;
+    }
+    return this.wanted.get(stmNum) ?? new Map();
   }
 
   private ownTemp?: TempDir;
 
   /**
-   * Parses at an offset in any reader, growing the window as needed. A window that reaches `bound`, the next known
-   * object, grows further only while a budget for the whole file lasts, so damaged files still parse and crafted
-   * ones stay linear. `key` names the place read, so its bad tokens count once however often it is parsed.
+   * Parses at an offset in any reader. The window starts small and grows while the parser asks for more. A run of
+   * whitespace and comments that reaches the end of the window is skipped in the source and stands in the window as one
+   * space, and the body of a stream written inside the object is found in the source and left out, so the window holds
+   * the object's tokens and not its padding. A window that reaches `bound`, the next known object, grows further only
+   * while a budget for the whole file lasts, unless `hard` makes the bound the end of the data. `key` names the place
+   * read, so its bad tokens count once however often it is parsed.
    */
-  private async parseWindowed<T>(reader: Reader, size: number, offset: number, parse: (p: Parser) => T | Promise<T>, bound = size, key = String(offset)): Promise<T> {
-    let len = 4096;
-    let end = Math.min(bound, size);
+  private async parseWindowed<T>(
+    reader: Reader,
+    size: number,
+    offset: number,
+    parse: (p: Parser, at: (pos: number) => number) => T | Promise<T>,
+    bound = size,
+    key = String(offset),
+    options: { recover?: boolean; streams?: boolean; hard?: boolean; topStream?: boolean } = {},
+  ): Promise<T> {
+    // Offsets come from the file: /Prev, /XRefStm, an object stream's /First plus an offset. One before the start,
+    // or between two bytes, holds no object.
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new ParseError(`No object at offset ${offset}`);
+    const limit = options.hard ? Math.min(bound, size) : size;
+    // The window is `kept`, the pieces already parsed past, then the tail read from `tail` on. A piece marked as one
+    // byte stands for what was left out there: a skipped run of whitespace, or a stream body, starting at `from`.
+    const kept: Array<{ from: number; bytes: Uint8Array; one?: boolean }> = [];
+    let tail = offset;
+    let grow = 4096;
+    let end = Math.min(bound, limit);
+    let skips = 0;
+    // Stream bodies found in the source, by where they start: the length, or null with no endstream. And the lines
+    // after "stream" keywords, by where they start.
+    const bodies = new Map<number, { length: number } | null>();
+    const lines = new Map<number, { text: boolean }>();
     for (;;) {
       // Each larger window parses the object again from the start.
       this.checkTime();
-      const n = Math.min(len, end - offset);
-      if (offset + n > bound) {
-        this.parseBudget -= n;
+      let keptLength = 0;
+      for (const k of kept) keptLength += k.bytes.length;
+      const n = Math.max(0, Math.min(grow, end - tail));
+      if (!options.hard && tail + n > bound) {
+        this.parseBudget -= keptLength + n;
         if (this.parseBudget < 0) throw new ParseError('Object runs past the next object');
       }
-      const window = await reader.read(offset, n);
-      const atEnd = offset + window.length >= size;
+      const tailBytes = n > 0 ? await reader.read(tail, n) : new Uint8Array(0);
+      const window = kept.length ? Buffer.concat([...kept.map(k => k.bytes), tailBytes]) : tailBytes;
+      const atEnd = tail + tailBytes.length >= limit;
+      /** Where window byte `pos` sits in the source. */
+      const at = (pos: number): number => {
+        let base = 0;
+        for (const k of kept) {
+          if (pos < base + k.bytes.length) return k.one ? k.from : k.from + pos - base;
+          base += k.bytes.length;
+        }
+        return tail + pos - base;
+      };
       let bad = 0;
-      const p = new Parser(window, 0, atEnd, { ...this.hooks, onBadToken: () => bad++ });
+      // Each /Length not read yet costs one more parse of the window, so an object may name only a few.
+      let lengths = 0;
+      const streams: DirectStreams | undefined = options.streams
+        ? {
+            at,
+            length: (ref: PdfRef) => {
+              if (++lengths > MAX_INDIRECT_LENGTHS) throw new ParseError('Too many streams with an indirect /Length');
+              if (!this.directLengths.has(ref.num)) throw new NeedObject(ref);
+              return this.directLengths.get(ref.num);
+            },
+            known: (start: number) => bodies.get(start),
+            line: (start: number) => lines.get(start),
+          }
+        : undefined;
+      const p = new Parser(window, 0, atEnd, { ...this.hooks, onBadToken: () => bad++ }, { recover: options.recover, streams, topStream: options.topStream });
       let final = true;
+      let more: NeedMoreData | undefined;
       try {
-        return await parse(p);
+        return await parse(p, at);
       } catch (e) {
+        if (e instanceof NeedObject) {
+          // The same window parses again once the length is known. It is marked first, so a length that leads back
+          // to the object being parsed reads as unknown.
+          final = false;
+          this.directLengths.set(e.ref.num, undefined);
+          const v = await this.getObject(e.ref);
+          this.directLengths.set(e.ref.num, typeof v === 'number' && Number.isInteger(v) ? v : undefined);
+          continue;
+        }
         final = !(e instanceof NeedMoreData) || atEnd;
         if (final) throw e;
+        more = e as NeedMoreData;
       } finally {
         // A larger window reads the same tokens again; only the read that ends counts them.
         if (final && bad && !this.badTokensCounted.has(key)) {
@@ -1026,10 +2038,179 @@ export class PdfDocument {
           this.issues.malformed += bad;
         }
       }
-      if (offset + window.length >= end) end = size;
-      len *= 4;
-      if (len > 256 * 1024 * 1024) throw new ParseError('Object too large');
+      const cut = (pos: number) => {
+        // Keeps window bytes [0, pos), which the parser has read past, and drops the rest.
+        let base = 0;
+        for (let i = 0; i < kept.length; i++) {
+          const k = kept[i];
+          if (pos <= base + k.bytes.length) {
+            kept[i] = { ...k, bytes: k.bytes.subarray(0, pos - base) };
+            kept.length = i + 1;
+            return;
+          }
+          base += k.bytes.length;
+        }
+        if (pos > base) kept.push({ from: tail, bytes: tailBytes.subarray(0, pos - base) });
+      };
+      const { body, idle, line } = more;
+      const softBound = options.hard ? limit : bound;
+      // Past a number of these, the window grows over what is left instead, so the passes stay few.
+      if (skips < MAX_SKIPS && body && options.streams) {
+        // The body of a stream written inside the object: found in the source, then left out of the window.
+        skips++;
+        const start = at(body.start);
+        if (bodies.has(start)) throw new ParseError('A stream body was found twice');
+        const found = await this.findBody(reader, start, body.declared, limit, softBound);
+        bodies.set(start, found);
+        if (found) {
+          cut(body.start);
+          kept.push({ from: start, bytes: Buffer.from(' '), one: true });
+          tail = found.after;
+          if (tail >= end) end = limit;
+        }
+        continue;
+      }
+      if (skips < MAX_SKIPS && line && options.streams) {
+        // The line after a "stream" keyword: its end found in the source. The body starts after it.
+        skips++;
+        const start = at(line.from - 1) + 1;
+        if (lines.has(start)) throw new ParseError('A stream line was found twice');
+        const found = await this.lineEnd(reader, start, limit, softBound);
+        lines.set(start, { text: found.text });
+        cut(line.from);
+        tail = found.after;
+        if (tail >= end) end = limit;
+        continue;
+      }
+      if (skips < MAX_SKIPS && idle) {
+        // A run of whitespace or comments reaches the end of the window: the rest of it is skipped in the source.
+        let comment = false;
+        for (let i = idle.from; i < window.length; i++) {
+          const c = window[i];
+          if (comment) comment = c !== 0x0a && c !== 0x0d;
+          else comment = idle.comments && c === 0x25;
+        }
+        const edge = tail + tailBytes.length;
+        const next = await this.skipRun(reader, edge, comment, idle.comments, limit, softBound);
+        if (next > edge || idle.from < window.length) {
+          skips++;
+          const from = idle.from < window.length ? at(idle.from) : edge;
+          cut(idle.from);
+          kept.push({ from, bytes: Buffer.from(' '), one: true });
+          tail = next;
+          // The window goes on past the next known object only while the budget lasts.
+          if (tail >= end) end = limit;
+          continue;
+        }
+      }
+      if (tail + tailBytes.length >= end) end = limit;
+      grow *= 4;
+      if (grow > 256 * 1024 * 1024) throw new ParseError('Object too large');
     }
+  }
+
+  /**
+   * Where the line after a "stream" keyword ends, as pdf.js finds it: after the first CR, LF or CRLF from `start` on, or
+   * at `limit`. `text` says whether anything but spaces came first. Bytes past `bound` come out of the parse budget.
+   */
+  private async lineEnd(reader: Reader, start: number, limit: number, bound: number): Promise<{ after: number; text: boolean }> {
+    let text = false;
+    let charged = Math.max(start, bound);
+    for (let pos = start; pos < limit; ) {
+      this.checkTime();
+      const buf = await reader.source.read(pos, Math.min(SKIP_CHUNK, limit - pos));
+      if (buf.length === 0) break;
+      let i = 0;
+      for (; i < buf.length && buf[i] !== 0x0d && buf[i] !== 0x0a; i++) if (buf[i] !== 0x20 && buf[i] !== 0x09 && buf[i] !== 0x0c && buf[i] !== 0x00) text = true;
+      const reached = pos + Math.min(i + 2, buf.length);
+      if (reached > charged) {
+        this.parseBudget -= reached - charged;
+        charged = reached;
+        if (this.parseBudget < 0) throw new ParseError('Object runs past the next object');
+      }
+      if (i < buf.length) {
+        const eol = pos + i;
+        const next = i + 1 < buf.length ? buf[i + 1] : eol + 1 < limit ? (await reader.read(eol + 1, 1))[0] : -1;
+        const crlf = buf[i] === 0x0d && next === 0x0a;
+        return { after: Math.min(limit, eol + (crlf ? 2 : 1)), text };
+      }
+      pos += buf.length;
+    }
+    return { after: limit, text };
+  }
+
+  /**
+   * Where a run of whitespace, and of comments when `comments` is set, ends: the first byte at or after `from` that
+   * belongs to neither, or `limit`. `comment` says whether `from` is inside a comment. Bytes past `bound` come out of
+   * the parse budget.
+   */
+  private async skipRun(reader: Reader, from: number, comment: boolean, comments: boolean, limit: number, bound: number): Promise<number> {
+    let inComment = comment;
+    // Bytes past `bound` come out of the budget once each.
+    let charged = Math.max(from, bound);
+    const charge = (to: number) => {
+      if (to > charged) {
+        this.parseBudget -= to - charged;
+        charged = to;
+      }
+      if (this.parseBudget < 0) throw new ParseError('Object runs past the next object');
+      return to;
+    };
+    for (let pos = from; pos < limit; ) {
+      this.checkTime();
+      const buf = await reader.source.read(pos, Math.min(SKIP_CHUNK, limit - pos));
+      if (buf.length === 0) break;
+      // Padding is mostly one byte repeated, which a comparison skips at once.
+      const pad = padding();
+      if (view(buf).equals(pad.spaces.subarray(0, buf.length)) || view(buf).equals(pad.zeros.subarray(0, buf.length))) {
+        pos += buf.length;
+        if (pos > bound) charge(pos);
+        continue;
+      }
+      for (let i = 0; i < buf.length; i++) {
+        const c = buf[i];
+        if (inComment) inComment = c !== 0x0a && c !== 0x0d;
+        else if (comments && c === 0x25) inComment = true;
+        else if (!isWhite(c)) return charge(pos + i);
+      }
+      pos += buf.length;
+    }
+    return charge(limit);
+  }
+
+  /**
+   * Finds the body of a stream written inside an object, starting at `start`, as the parser would in a window that held
+   * it: at its /Length when "endstream" follows after whitespace, and otherwise at the first "endstream". Returns its
+   * length and where the object goes on after "endstream", or null when no "endstream" comes before `limit`.
+   */
+  private async findBody(reader: Reader, start: number, declared: number | undefined, limit: number, bound: number): Promise<{ length: number; after: number } | null> {
+    if (declared !== undefined && declared >= 0 && start + declared <= limit) {
+      const p = await this.skipRun(reader, start + declared, false, false, limit, bound);
+      if (p + ENDSTREAM.length <= limit && view(await reader.read(p, ENDSTREAM.length)).equals(ENDSTREAM)) return { length: declared, after: p + ENDSTREAM.length };
+    }
+    for (let pos = start; pos < limit; ) {
+      this.checkTime();
+      const n = Math.min(65536, limit - pos);
+      if (pos + n > bound) {
+        this.parseBudget -= pos + n - Math.max(pos, bound);
+        if (this.parseBudget < 0) throw new ParseError('Object runs past the next object');
+      }
+      // Overlapping reads find a keyword that spans two of them.
+      const buf = await reader.read(pos, Math.min(n + ENDSTREAM.length, limit - pos));
+      const found = endstreamIn(buf, 0);
+      if (found && found.at < n) {
+        const at = pos + found.at;
+        // The EOL before "endstream" belongs to the keyword, as for any other stream.
+        let end = at;
+        const back = await reader.read(Math.max(start, at - 2), Math.min(2, at - start));
+        if (back.length === 2 && back[0] === 0x0d && back[1] === 0x0a) end -= 2;
+        else if (back.length >= 1 && (back[back.length - 1] === 0x0a || back[back.length - 1] === 0x0d)) end -= 1;
+        return { length: end - start, after: at + found.length };
+      }
+      if (buf.length < n) break;
+      pos += n;
+    }
+    return null;
   }
 
   async resolve(v: PdfObject | undefined): Promise<PdfObject | undefined> {
@@ -1048,14 +2229,33 @@ export class PdfDocument {
 
   /** Length of the stream once decrypted, which is what gets written out. */
   async plainLength(stream: PdfStream, num: number): Promise<number> {
-    if (!this.security) return stream.length;
-    return this.security.plainLength(stream, num, this.genOf(num), (o, l) => this.reader.read(stream.offset + o, l));
+    const held = this.heldBodies.get(num);
+    if (held) return held.length;
+    const key = this.keyOf(num);
+    if (!this.security || !key) return stream.length;
+    return this.security.plainLength(stream, key.num, key.gen, (o, l) => this.reader.read(stream.offset + o, l));
+  }
+
+  /** False for a stream encrypted with a key the password did not give, as attached files can be. */
+  canDecrypt(stream: PdfStream, num: number): boolean {
+    return !this.security || this.heldBodies.has(num) || !this.keyOf(num) || this.security.canDecrypt(stream);
   }
 
   /** Yields the decrypted, still-encoded body in chunks. */
   async *plainChunks(stream: PdfStream, num: number): AsyncGenerator<Uint8Array> {
+    const held = this.heldBodies.get(num);
+    if (held) {
+      const stm = this.objStms.get(held.stm);
+      if (!stm) throw new Error(`Object stream ${held.stm} is no longer decoded`);
+      for await (const c of this.objStmReader(held.stm, stm).chunks(held.offset, held.length)) {
+        this.checkTime();
+        yield c;
+      }
+      return;
+    }
     let dec: ChunkDecryptor | undefined;
-    if (this.security) dec = this.security.chunkDecryptor(stream, num, this.genOf(num), await this.plainLength(stream, num));
+    const key = this.keyOf(num);
+    if (this.security && key) dec = this.security.chunkDecryptor(stream, key.num, key.gen, await this.plainLength(stream, num));
     for await (const c of this.reader.chunks(stream.offset, stream.length)) {
       this.checkTime();
       const out = dec ? dec.update(c) : c;
@@ -1235,21 +2435,37 @@ export class PdfDocument {
     await this.dropObjStms();
     this.objCache = new Lru(1);
     this.xref.clear();
+    this.synthetic.clear();
+    this.syntheticAt.clear();
+    this.heldBodies.clear();
     this.sortedOffsets = undefined;
     this.liveByOffset = undefined;
     this.lastLive = undefined;
     await this.ownTemp?.cleanup();
   }
 
-  /** Forgets every decoded object stream, closing and deleting the ones that spilled to a temporary file. */
+  /**
+   * Forgets every decoded object stream, closing and deleting the temporary files, once the map or the key changes. The
+   * streams whose bodies they held are forgotten with the parsed objects.
+   */
   private async dropObjStms(): Promise<void> {
-    const spilled = Array.from(this.spilledObjStm.values());
-    this.objStmCache = new Lru(8);
-    this.spilledObjStm.clear();
-    for (const s of spilled) {
+    const readers = [...this.objStmReaders.values(), ...this.objStmFileReaders.values()];
+    const files = this.objStmFiles;
+    const pool = this.pool;
+    if (pool) files.push(pool.path);
+    this.objStmReaders = new Lru(256);
+    this.objStmFileReaders = new Lru(8);
+    this.objStmFiles = [];
+    this.pool = undefined;
+    await pool?.handle.close().catch(() => undefined);
+    this.objStms.clear();
+    this.inMemory.clear();
+    this.inMemoryBytes = 0;
+    this.wanted = undefined;
+    for (const r of readers) await r.source.close?.()?.catch(() => undefined);
+    for (const f of files) {
       try {
-        await s.source.close?.();
-        await fsp.rm(s.path, { force: true });
+        await fsp.rm(f, { force: true });
       } catch {
         /* the run's temporary directory is removed later anyway */
       }

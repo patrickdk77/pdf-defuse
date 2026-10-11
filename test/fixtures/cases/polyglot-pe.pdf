@@ -1,0 +1,13 @@
+MZ pdf-defuse fixture: marker bytes in place of an executable
+%PDF-1.4
+1 0 obj
+<< /Kids [<< /Parent 1 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents [2 0 R] >>] /Count 1 >>
+endobj
+2 0 obj
+<< >>
+stream
+BT /F1 24 Tf 72 720 Td (PDF/PE fixture) Tj ET
+endstream
+endobj
+trailer
+<< /Root << /Pages 1 0 R >> >>

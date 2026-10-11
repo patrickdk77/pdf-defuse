@@ -596,7 +596,8 @@ describe('review: round 2, part b', function () {
         { obj: 1, body: `<< /Type /Catalog /Pages 2 0 R /OpenAction 6 0 R ${signed ? FIELD : ''} >>` },
         { obj: 2, body: PAGES },
         { obj: 3, body: '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>' },
-        { obj: 7, body: { dict: `<< /Type /ObjStm /N 1 /First 4 /Filter /BrotliDecode /Length ${body.length} >>`, data: body } },
+        // pdf.js ignores a predictor on BrotliDecode and PDFium applies it, so pdf-defuse does not read this stream.
+        { obj: 7, body: { dict: `<< /Type /ObjStm /N 1 /First 4 /Filter /BrotliDecode /DecodeParms << /Predictor 2 >> /Length ${body.length} >>`, data: body } },
         ...(signed ? SIG_OBJECTS : []),
         (off, pos) => {
           const list: Array<[number, number, number]> = [

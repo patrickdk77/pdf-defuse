@@ -209,8 +209,8 @@ describe('review: round 3', function () {
         script: r.bytes ? (await pdfjs(r.bytes)).docScript : null,
       };
     }
-    // A hybrid file whose /XRefStm reads, at whitespace before its stream, defines nothing hidden. Its table marks the
-    // object the stream gives free, a row pdf.js keeps, so that is reported.
+    // A hybrid file whose /XRefStm reads, at whitespace before its stream. Its table marks the object the stream gives
+    // free, a row pdf.js keeps, so that is reported, and the definition only the stream names is one other readers take.
     const hybrid = await inspectPdf(hybridBeforeStream());
     seen.hybrid = { status: hybrid.status, shadowed: has(hybrid, C.Structure, D.ShadowedObjects), malformed: has(hybrid, C.Corrupted, D.MalformedObject) };
     const out = { status: 'defused', shadowed: 1, qpdfOutput: false, script: false };
@@ -218,7 +218,7 @@ describe('review: round 3', function () {
       none: { ...out, xrefStm: 0, qpdfInput: false },
       exact: { ...out, xrefStm: 1, qpdfInput: true },
       ws: { ...out, xrefStm: 1, qpdfInput: true },
-      hybrid: { status: 'strippable', shadowed: false, malformed: true },
+      hybrid: { status: 'strippable', shadowed: true, malformed: true },
     });
   });
 

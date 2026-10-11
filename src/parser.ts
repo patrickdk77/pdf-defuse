@@ -1,16 +1,40 @@
 import { hexVal, Out } from './filters';
-import { PdfDict, PdfName, type PdfObject, PdfRef, PdfString } from './objects';
+import { PdfDict, PdfName, type PdfObject, PdfRef, PdfStream, PdfString } from './objects';
 
 export class ParseError extends Error {}
-/** Thrown when the window ended before the object did. The caller retries with more bytes. */
-export class NeedMoreData extends Error {}
+/** The data ended inside an object. */
+export class EndOfData extends ParseError {}
+/**
+ * Thrown when the window ended before the object did. The caller retries with more bytes. `idle` says the window ended
+ * in a run of whitespace, and of comments when `comments` is set, that started at window position `from`, so the
+ * caller can skip the rest of the run in the source instead of holding it. `body` says it ended in the body of a stream
+ * written inside an object, and `line` before the end of the line after a "stream" keyword. The caller can find either
+ * end in the source.
+ */
+export class NeedMoreData extends Error {
+  constructor(
+    readonly idle?: { from: number; comments: boolean },
+    readonly body?: { start: number; declared?: number },
+    readonly line?: { from: number },
+  ) {
+    super('More data is needed');
+  }
+}
+/** Thrown when a stream inside an object has a /Length the caller has not read yet. The caller reads it and retries. */
+export class NeedObject extends Error {
+  constructor(readonly ref: PdfRef) {
+    super(`Object ${ref.num} is needed`);
+  }
+}
 
 const WS = new Uint8Array(256);
 for (const c of [0x00, 0x09, 0x0a, 0x0c, 0x0d, 0x20]) WS[c] = 1;
 const DELIM = new Uint8Array(256);
 for (const c of '()<>[]{}/%') DELIM[c.charCodeAt(0)] = 1;
 /** Keywords that frame objects. Skipping one as junk could run an unterminated object into the next. */
-const KEYWORDS = new Set(['true', 'false', 'null', 'obj', 'endobj', 'stream', 'endstream', 'R', 'xref', 'trailer', 'startxref']);
+const FRAMING = new Set(['obj', 'endobj', 'stream', 'endstream', 'xref', 'trailer', 'startxref']);
+const KEYWORDS = new Set([...FRAMING, 'true', 'false', 'null', 'R']);
+const ENDSTREAM = Buffer.from('endstream', 'latin1');
 /**
  * A number as ISO 32000 writes it. It must match only one way: a pattern that can split a digit run backtracks
  * quadratically on a long bad token.
@@ -24,6 +48,23 @@ const NUMBER = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
 const MAX_OVERHEAD = 16 * 1024 * 1024;
 
 export const isWhite = (c: number) => WS[c] === 1;
+
+const END = Buffer.from('end', 'latin1');
+/**
+ * Where pdf.js ends a stream body it searches for: at "endstream", or at "endsteam" or "endstrea" before a space, tab,
+ * CR or LF, which it takes too. Returns the first such place in `b` from `from` on and the keyword's length. A
+ * misspelling whose next byte `b` does not hold is left for a longer window.
+ */
+export function endstreamIn(b: Uint8Array, from: number): { at: number; length: number } | undefined {
+  const v = Buffer.from(b.buffer, b.byteOffset, b.byteLength);
+  const is = (at: number, word: string) => at + word.length <= v.length && v.toString('latin1', at, at + word.length) === word;
+  for (let k = v.indexOf(END, from); k >= 0; k = v.indexOf(END, k + 1)) {
+    if (is(k + 3, 'stream')) return { at: k, length: 9 };
+    const c = v[k + 8];
+    if ((is(k + 3, 'steam') || is(k + 3, 'strea')) && (c === 0x20 || c === 0x09 || c === 0x0d || c === 0x0a)) return { at: k, length: 8 };
+  }
+  return undefined;
+}
 const isRegular = (c: number) => !WS[c] && !DELIM[c];
 const isDigit = (c: number) => c >= 0x30 && c <= 0x39;
 
@@ -42,6 +83,33 @@ interface ParseHooks {
   onProgress?(): void;
 }
 
+/** How to read a stream written inside an object, as pdf.js reads one, and the end of the line after "stream". */
+export interface DirectStreams {
+  /** Where window byte `pos` sits in the source. */
+  at(pos: number): number;
+  /** The value of an indirect /Length. Throws NeedObject when the caller has not read it yet. */
+  length(ref: PdfRef): number | undefined;
+  /**
+   * A body the caller found in the source, by where it starts there: its length, or null when no "endstream" follows.
+   * The window then holds one byte for the body and goes on after "endstream".
+   */
+  known(start: number): { length: number } | null | undefined;
+  /**
+   * The line after a "stream" keyword that the caller read in the source, by where it starts there: whether it held
+   * more than spaces. The window then goes on where the body starts.
+   */
+  line(start: number): { text: boolean } | undefined;
+}
+
+export interface ParseOptions {
+  /** Ends a dictionary or array that the end of the data cuts off, as pdf.js reads a trailer it recovers. */
+  recover?: boolean;
+  /** Reads a dictionary followed by "stream" anywhere inside an object as a stream. */
+  streams?: DirectStreams;
+  /** Reads the object itself as a stream in the same way, for an object stored in an object stream. */
+  topStream?: boolean;
+}
+
 /**
  * Parses PDF objects from a byte window. `eof` tells the parser whether the window ends at the end of the source,
  * so running off the end means NeedMoreData rather than a syntax error.
@@ -54,13 +122,25 @@ export class Parser {
   /** The part of `cost` that does not grow with the length of a name or string. */
   private overhead = 0;
   private values = 0;
+  /** The part of `cost` that the dictionaries of streams written inside the object take. */
+  directCost = 0;
   constructor(
     readonly buf: Uint8Array,
     pos = 0,
     readonly eof = true,
     readonly hooks: ParseHooks = {},
+    readonly options: ParseOptions = {},
   ) {
     this.pos = pos;
+  }
+
+  /** In recovery, whether nothing but whitespace and comments is left before the end of the data. */
+  private cutOff(): boolean {
+    if (!this.options.recover || !this.eof) return false;
+    const save = this.pos;
+    if (!this.skipToToken()) return true;
+    this.pos = save;
+    return false;
   }
 
   /** Rough heap costs: a slot for a number or keyword, an object for a name or reference, a buffer for a string. */
@@ -72,7 +152,7 @@ export class Parser {
   }
 
   private more(): never {
-    if (this.eof) throw new ParseError(`Unexpected end of data at ${this.pos}`);
+    if (this.eof) throw new EndOfData(`Unexpected end of data at ${this.pos}`);
     throw new NeedMoreData();
   }
 
@@ -82,7 +162,16 @@ export class Parser {
   }
 
   skipWhitespace(): void {
+    if (!this.skipToToken()) this.more();
+  }
+
+  /**
+   * Skips whitespace and comments, and says whether anything follows them. A window that ends first asks for more,
+   * unless it ends the data.
+   */
+  private skipToToken(): boolean {
     const b = this.buf;
+    const from = this.pos;
     for (;;) {
       while (this.pos < b.length && WS[b[this.pos]]) this.pos++;
       if (this.pos < b.length && b[this.pos] === 0x25) {
@@ -91,7 +180,9 @@ export class Parser {
       }
       break;
     }
-    if (this.pos >= b.length) this.more();
+    if (this.pos < b.length) return true;
+    if (this.eof) return false;
+    throw new NeedMoreData({ from, comments: true });
   }
 
   /** Reads a regular-character token without consuming delimiters. */
@@ -110,14 +201,9 @@ export class Parser {
 
   matchKeyword(word: string): boolean {
     const save = this.pos;
-    try {
-      this.skipWhitespace();
-    } catch (e) {
-      if (e instanceof ParseError) {
-        this.pos = save;
-        return false;
-      }
-      throw e;
+    if (!this.skipToToken()) {
+      this.pos = save;
+      return false;
     }
     for (let i = 0; i < word.length; i++) {
       if (this.pos + i >= this.buf.length) {
@@ -157,8 +243,17 @@ export class Parser {
     if (c === 0x28) return this.parseLiteralString();
     if (c === 0x3c) {
       if (this.pos + 1 >= this.buf.length) this.more();
-      if (this.buf[this.pos + 1] === 0x3c) return this.parseDict();
-      return this.parseHexString();
+      if (this.buf[this.pos + 1] !== 0x3c) return this.parseHexString();
+      const before = this.cost;
+      const counted = this.directCost;
+      const d = this.parseDict();
+      // An object's own stream is the caller's to read, unless it sits in an object stream. pdf.js reads a stream after
+      // any dictionary inside an object too.
+      const s = (this.depth > 0 || this.options.topStream) && this.options.streams ? this.directStream(d, this.options.streams) : undefined;
+      if (!s) return d;
+      // The whole dictionary, which already holds what the streams inside it cost.
+      this.directCost = counted + this.cost - before;
+      return s;
     }
     if (c === 0x5b) return this.parseArray();
     if (c === 0x2b || c === 0x2d || c === 0x2e || isDigit(c)) {
@@ -185,6 +280,7 @@ export class Parser {
       // Possible reference: int int R
       let q = p;
       while (q < b.length && WS[b[q]]) q++;
+      if (q >= b.length && !this.eof) throw new NeedMoreData({ from: p, comments: false });
       const gs = q;
       let g = 0;
       while (q < b.length && isDigit(b[q]) && q - gs < 6) g = g * 10 + (b[q++] - 0x30);
@@ -192,6 +288,7 @@ export class Parser {
       // pdf.js, poppler and Ghostscript also take an "R" written against the generation, as in "5 0R>>".
       if (q > gs && q < b.length && (WS[b[q]] || b[q] === 0x52)) {
         while (q < b.length && WS[b[q]]) q++;
+        if (q >= b.length && !this.eof) throw new NeedMoreData({ from: ge, comments: false });
         if (b[q] === 0x52) {
           if (q + 1 >= b.length && !this.eof) throw new NeedMoreData();
           if (q + 1 >= b.length || !isRegular(b[q + 1])) {
@@ -351,6 +448,7 @@ export class Parser {
     this.charge(48);
     const arr: PdfObject[] = [];
     for (;;) {
+      if (this.cutOff()) break;
       this.skipWhitespace();
       if (this.peek() === 0x5d) {
         this.pos++;
@@ -368,6 +466,7 @@ export class Parser {
     this.charge(256);
     const d = new PdfDict();
     for (;;) {
+      if (this.cutOff()) break;
       this.skipWhitespace();
       const c = this.peek();
       if (c === 0x3e) {
@@ -385,11 +484,13 @@ export class Parser {
         if (open) {
           this.hooks.onBadToken?.(open === 1 ? '[' : '<<');
           this.pos += open;
-        } else if (!this.skipBadToken()) this.parseObject();
+        } else if (!this.skipBadToken(true)) this.parseObject();
         continue;
       }
       const k = this.parseName();
       if (d.has(k.name)) this.hooks.onDuplicateKey?.(k.name);
+      // pdf.js drops a key that the end of the data cuts off from its value.
+      if (this.cutOff()) break;
       this.skipWhitespace();
       if (this.peek() === 0x3e) {
         if (this.pos + 1 >= this.buf.length) this.more();
@@ -409,9 +510,10 @@ export class Parser {
   /**
    * Skips junk inside a container instead of losing the whole object: an unknown bare keyword, or a delimiter that
    * cannot start an object, such as "]" in a dictionary or ">>" in an array. qpdf reads each of these as null. The
-   * container's own closing delimiter was checked before this is called.
+   * container's own closing delimiter was checked before this is called. Where a key belongs, pdf.js also skips a
+   * number, "R", "true", "false" or "null" one token at a time, and so does this.
    */
-  private skipBadToken(): boolean {
+  private skipBadToken(key = false): boolean {
     const c = this.peek();
     if (c === 0x5d || c === 0x29 || c === 0x7b || c === 0x7d || c === 0x3e) {
       if (c === 0x3e && this.pos + 1 >= this.buf.length) this.more();
@@ -420,10 +522,10 @@ export class Parser {
       this.pos += n;
       return true;
     }
-    if (!isRegular(c) || c === 0x2b || c === 0x2d || c === 0x2e || isDigit(c)) return false;
+    if (!isRegular(c) || (!key && (c === 0x2b || c === 0x2d || c === 0x2e || isDigit(c)))) return false;
     const save = this.pos;
     const tok = this.readToken();
-    if (KEYWORDS.has(tok)) {
+    if (FRAMING.has(tok) || (!key && KEYWORDS.has(tok))) {
       this.pos = save;
       return false;
     }
@@ -432,36 +534,81 @@ export class Parser {
   }
 
   /**
+   * After a dictionary inside an object, reads the stream that follows it, if any, as pdf.js does: the body ends at
+   * /Length when "endstream" follows there, and at the first "endstream" otherwise. Returns undefined when no stream
+   * follows. The body stays in the source; the stream records where it is.
+   */
+  private directStream(dict: PdfDict, streams: DirectStreams): PdfStream | undefined {
+    const start = this.streamStart();
+    if (start < 0) return undefined;
+    const b = this.buf;
+    const at = streams.at(start);
+    const known = streams.known(at);
+    if (known === null) throw new ParseError(`Missing endstream at ${start}`);
+    if (known) {
+      this.pos = start + 1;
+      return new PdfStream(dict, at, known.length);
+    }
+    const L = dict.get('Length');
+    const declared = typeof L === 'number' && Number.isInteger(L) ? L : L instanceof PdfRef ? streams.length(L) : undefined;
+    if (declared !== undefined && declared >= 0) {
+      let p = start + declared;
+      while (p < b.length && WS[b[p]]) p++;
+      if (p + ENDSTREAM.length > b.length && !this.eof) throw new NeedMoreData(undefined, { start, declared });
+      if (p + ENDSTREAM.length <= b.length && ENDSTREAM.every((x, i) => b[p + i] === x)) {
+        this.pos = p + ENDSTREAM.length;
+        return new PdfStream(dict, at, declared);
+      }
+    }
+    const found = endstreamIn(b, start);
+    if (!found) {
+      if (!this.eof) throw new NeedMoreData(undefined, { start, declared });
+      throw new ParseError(`Missing endstream at ${start}`);
+    }
+    const k = found.at;
+    // The EOL before "endstream" belongs to the keyword, as for any other stream.
+    let end = k;
+    if (end - 2 >= start && b[end - 2] === 0x0d && b[end - 1] === 0x0a) end -= 2;
+    else if (end - 1 >= start && (b[end - 1] === 0x0a || b[end - 1] === 0x0d)) end -= 1;
+    this.pos = k + found.length;
+    return new PdfStream(dict, at, end - start);
+  }
+
+  /**
    * After a dictionary, checks for the "stream" keyword. Returns the position of the first body byte,
    * or -1 when the object is not a stream.
    */
   streamStart(): number {
     const save = this.pos;
-    try {
-      this.skipWhitespace();
-    } catch (e) {
-      if (e instanceof ParseError) return -1;
-      throw e;
+    if (!this.skipToToken()) {
+      this.pos = save;
+      return -1;
     }
     if (!this.matchKeyword('stream')) {
       this.pos = save;
       return -1;
     }
     const b = this.buf;
-    // Spaces and tabs before the EOL are skipped. Anything else leaves the body starting right after the keyword,
-    // while pdf.js skips everything up to the EOL, so that text is reported.
+    // pdf.js starts the body after the first EOL that follows the keyword, whatever comes before it. Other readers take
+    // text there as part of the body, so it is reported.
+    const streams = this.options.streams;
+    const line = streams?.line(streams.at(this.pos - 1) + 1);
+    if (line) {
+      if (line.text) this.hooks.onBadToken?.('stream');
+      return this.pos;
+    }
     let p = this.pos;
-    while (p < b.length && (b[p] === 0x20 || b[p] === 0x09 || b[p] === 0x0c || b[p] === 0x00)) p++;
-    if (p >= b.length && !this.eof) throw new NeedMoreData();
-    if (b[p] === 0x0d || b[p] === 0x0a) this.pos = p;
-    else this.hooks.onBadToken?.('stream');
-    if (this.pos >= b.length) this.more();
-    if (b[this.pos] === 0x0d) {
-      this.pos++;
-      if (this.pos >= b.length && !this.eof) throw new NeedMoreData();
-      if (b[this.pos] === 0x0a) this.pos++;
-    } else if (b[this.pos] === 0x0a) this.pos++;
-    return this.pos;
+    let text = false;
+    for (; p < b.length && b[p] !== 0x0d && b[p] !== 0x0a; p++) if (b[p] !== 0x20 && b[p] !== 0x09 && b[p] !== 0x0c && b[p] !== 0x00) text = true;
+    // A line the window cuts off, or a CR that may have its LF after the window, is found in the source.
+    if ((p >= b.length || (b[p] === 0x0d && p + 1 >= b.length)) && !this.eof) {
+      if (streams) throw new NeedMoreData(undefined, undefined, { from: this.pos });
+      throw new NeedMoreData();
+    }
+    if (text) this.hooks.onBadToken?.('stream');
+    if (p < b.length) p += b[p] === 0x0d && b[p + 1] === 0x0a ? 2 : 1;
+    this.pos = p;
+    return p;
   }
 }
 

@@ -8,7 +8,7 @@ It has no runtime dependencies, keeps memory bounded, and runs the same code for
 npm install @patrickdk77/pdf-defuse
 ```
 
-Node 22 or later.
+Node 18 or later.
 
 ## Quick start
 
@@ -31,7 +31,7 @@ ES modules work too: `import { disarmPdf } from '@patrickdk77/pdf-defuse'`.
 
 The engine reads through a source with `size()` and `read(offset, length)`, and writes to a sink that only appends, with `write(chunk)` and `close()`. A local file, a buffer and an S3 object all fit, so large files never need to sit in memory. `disarmPdfSource` reads the source once, start to end, into its own copy and works from that. For S3 that is one pass of ranged reads.
 
-`inspectPdfSource` and `disarmPdfSource` call the source's `close()`, if it has one, when the run ends. `fileSource` opens its file again if something reads it after that. A `read` must return exactly the bytes asked for, or fewer only at the end of the source. A read that returns any other length fails the run with an error whose `code` is `EIO`, because it would shift every byte after it.
+`inspectPdfSource` and `disarmPdfSource` call the source's `close()`, if it has one, when the run ends. `fileSource` opens its file again if something reads it after that. A `read` must return exactly the bytes asked for, or fewer only at the end of the source. A read that returns any other length fails the run with an error whose `code` is `EIO`, because it would shift every byte after it. pdf-defuse never asks a source for a read that starts outside it, even when a damaged file points there. `bufferSource`, `fileSource` and the source a file plugin receives return no bytes for a read that starts outside the data or at an offset that is not a whole number.
 
 ```js
 const { disarmPdfSource, fileSource, fileSink, writableSink } = require('@patrickdk77/pdf-defuse');
@@ -76,6 +76,12 @@ Kept: text, images, fonts, layout, bookmarks, form fields and their values, safe
 
 Every file that is not rejected is rewritten, so the output holds only what pdf-defuse read. That includes a file with nothing to remove, whose status stays `clean`.
 
+pdf-defuse reads damaged files the way pdf.js reads them, and a CORRUPTED finding reports each repair. That covers a file with no `%PDF-` header in its first 1024 bytes, which CORRUPTED/MISSING_HEADER reports, a catalog written in the trailer, a stream written inside another object or stored in an object stream, broken object streams, and a cross-reference table rebuilt by scanning. The rebuild ignores anything inside a comment and picks the trailer pdf.js picks. The output holds each repaired object as an object of its own.
+
+Where pdf.js opens nothing, pdf-defuse searches the whole file for objects and trailers, as other readers do, and rejects the file only when that finds none. It reads a stream pdf.js gives up on, such as one with no `endstream`, the way qpdf reads it. pdf.js draws nothing for such a stream. When one object in an object stream fails to parse, pdf.js can lose the whole stream, depending on the order it looks objects up in. pdf-defuse reads each object that parses.
+
+pdf-defuse decodes FlateDecode, LZWDecode, ASCIIHexDecode, ASCII85Decode, RunLengthDecode and BrotliDecode, so the objects, scripts and attached files inside them get the same checks as the rest of the file. Like pdf.js, it refuses Brotli data that is truncated, corrupt or followed by more bytes. It also refuses a BrotliDecode stream with a predictor, which pdf.js ignores and PDFium applies, and a filter chain with two BrotliDecode filters.
+
 A rewrite invalidates a signature, so a signed file can keep its bytes instead. That happens when the file is clean and a signature field reachable from the catalog holds a signature whose `/ByteRange` covers every byte of the file except that signature's `/Contents` value. Bytes added after signing fall outside that range, so a file updated after signing is rewritten. The file must also have no CORRUPTED finding, whatever its action, and no second definition of any object, not even one inside another object, which only a reader that rebuilds the cross-reference table by scanning would take. pdf-defuse does not verify the signature. Anyone can sign a file, with a self-signed certificate too, so this exception trusts whoever signed it. `preserveSignatures: false` rewrites signed files as well.
 
 Before anything reaches your sink, pdf-defuse inspects its own output. It rejects the file if anything removable is left, if the page count changed, or if any page's content changed length.
@@ -91,7 +97,7 @@ Every finding has two enums and a string. `category` is the kind, such as `ENCRY
 
 `action` says what happens: `reject` refuses the file, `strip` removes the content and `info` only reports it. An override to `strip` removes the content for METADATA/XMP, METADATA/INFO_DICTIONARY, LINK/SAFE and EMBEDDED_FILE/TYPE_MISMATCH. Some `info` findings name content that every rewrite drops anyway, such as SIGNATURE/USAGE_RIGHTS, STRUCTURE/ESCAPED_NAMES and the ENCRYPTED findings that name the algorithm. A `strip` override on one of those changes only the status. The other `info` findings, such as FORM/FIELDS, SIGNATURE/SIGNED, STRUCTURE/VERSION_UPGRADED and the PLUGIN_PASSED and PLUGIN_SCRUBBED findings, name nothing that can be removed. A `strip` override on one of them leaves the finding in the output, so the output fails its own inspection and the upload is rejected.
 
-Some content goes whatever an override says. Its finding then shows `strip`, or `reject` if you override it to that. This covers a script reference an action loses under the re-checking rules described under Plugins, a reference to an object stream or cross-reference stream, and an attached file a plugin removed or failed on. It also covers a reference in `/Annots` to an object that already has another role, and a reference to a file specification that is the catalog, a page, or the names or information dictionary and carries an embedded file. Such an object keeps its role and its own entries, `/EF` included, so that embedded file stays in the output. Only the reference that treated the object as a file specification goes.
+Some content goes whatever an override says. Its finding then shows `strip`, or `reject` if you override it to that. This covers a script reference an action loses under the re-checking rules described under Plugins, a reference to an object stream or cross-reference stream, and an attached file a plugin removed or failed on, or that the password does not decrypt. It also covers any other stream encrypted with a key the password does not give, which ENCRYPTED/NO_KEY reports. It also covers a reference in `/Annots` to an object that already has another role, and a reference to a file specification that is the catalog, a page, or the names or information dictionary and carries an embedded file. Such an object keeps its role and its own entries, `/EF` included, so that embedded file stays in the output. Only the reference that treated the object as a file specification goes.
 
 pdf-defuse compares what it would write with what it read. If it would remove something that no other finding names, the report gets PROCESSING/CONTENT_REMOVED, which follows the same rule. The status then shows the removal, and a signed file does not keep its bytes.
 
@@ -115,14 +121,14 @@ A run that stops before it has seen the whole file rejects the file with a null 
 
 | Option | Default | Purpose |
 |---|---|---|
-| `password` | `''` | Tried as the user password and then as the owner password. If it opens neither, the empty password is tried, so a file that needs no password still opens |
+| `password` | `''` | Tried as the user password, then as the owner password, then as the empty password. See Passwords below |
 | `limits` | none | `fileSize`, `objects`, `decompressedBytes`, `nestingDepth` and `timeMs`. A limit left out is not enforced |
 | `stripMetadata` | `false` | Remove the document information dictionary wherever it is referenced, and the XMP metadata of every object: the catalog, pages, images and the rest |
 | `actionOverrides` | none | Change the action for a category, or for a category and detail |
 | `scoreWeights`, `scoreBands` | built in | Change the scoring |
 | `filePlugins`, `scriptPlugins` | none | Keep chosen attached files or scripts |
 | `tempDir` | `os.tmpdir()` | Where temporary files go |
-| `memoryThreshold` | 8 MiB | `disarmPdfSource` keeps its copy of the upload in memory up to this size and in a temporary file above it. Each decoded attachment and object stream above this size goes through a temporary file. A decoded attachment's file is deleted once its plugins have decided it. Scrubbed attachment copies waiting for the write, and an attachment decoded again so a plugin can check its further names, share this much memory between them. One that does not fit goes to a temporary file. A script that decodes larger than this is removed without going to the script plugins |
+| `memoryThreshold` | 8 MiB | `disarmPdfSource` keeps its copy of the upload in memory up to this size and in a temporary file above it. Each decoded attachment above this size goes through a temporary file. Decoded object streams share this much memory, and the ones that do not fit go to temporary files, so each is decoded once. A decoded attachment's file is deleted once its plugins have decided it. Scrubbed attachment copies waiting for the write, and an attachment decoded again so a plugin can check its further names, share this much memory between them. One that does not fit goes to a temporary file. A script that decodes larger than this is removed without going to the script plugins |
 | `preserveSignatures` | `true` | Keep the bytes of a clean file that is signed over all of it, as described under What it removes and what it keeps. `false` rewrites it like any other file, which invalidates the signature |
 
 To reject every file that contains JavaScript instead of removing the scripts:
@@ -130,6 +136,14 @@ To reject every file that contains JavaScript instead of removing the scripts:
 ```js
 await disarmPdf(bytes, { actionOverrides: [{ category: 'JAVASCRIPT', action: 'reject' }] });
 ```
+
+### Passwords
+
+A revision 6 password, the AES-256 scheme of ISO 32000-2, is tried three ways: prepared with SASLprep, as that standard requires, prepared the way pdf.js prepares it, and as typed. The last opens files from tools that skip SASLprep. Other revisions use the password as typed.
+
+An empty owner password opens a file, as in qpdf, and ENCRYPTED/OWNER_PASSWORD reports it. pdf.js asks for a password there.
+
+A file that encrypts only its attached files, through a crypt filter with `/AuthEvent /EFOpen`, opens without the password, as in pdf.js, and ENCRYPTED/ATTACHMENTS_ONLY reports it. pdf-defuse removes the attached files the password does not decrypt and any other stream under their key, which ENCRYPTED/NO_KEY reports. pdf.js draws such a page blank.
 
 ## Plugins
 
@@ -280,11 +294,15 @@ A `--config` module's default export is the options object. For CommonJS that is
 
 Exit codes are 0 for clean, 1 for stripped or strippable, 2 for rejected and 3 for a usage or I/O error. An output or a report that could not be written is an I/O error, and so is a report whose reader has gone away. There is no password flag, because other users can read command-line arguments from the process list. An unknown option shows in the error without the text after its `=`, in case that text is a password typed in the wrong place.
 
-## Memory
+## Memory and time
 
 `disarmPdfSource` first copies the upload, in memory up to `memoryThreshold` and into a temporary file above it. It analyzes and writes from that copy only, so a source that changes during the run cannot get anything past the inspection. It rejects an upload over `limits.fileSize` without reading it. `inspectPdfSource` reads the source directly.
 
-The engine reads the cross-reference table from the end of the file, then reads only the objects reachable from the document root, one at a time. Stream bodies are copied and decrypted in chunks and are never loaded whole. Apart from the copy of the upload, memory grows with the number of objects, at roughly 250 bytes each, and not with the size of the file. A parsed value takes far more memory than its text, so pdf-defuse reads an object as damaged when its values would take more than about 16 MB, not counting the text of names and strings. It keeps at most about 32 MB of parsed objects for reuse.
+The engine reads the cross-reference table from the end of the file, then reads only the objects reachable from the document root, one at a time. Stream bodies are copied and decrypted in chunks and are never loaded whole. A stream body inside an object stream stays in the decoded object stream. A Brotli decoder can take 16 MB for its window, which is why a chain with two BrotliDecode filters is refused. Apart from the copy of the upload, memory grows with the number of objects, at roughly 250 bytes each, and not with the size of the file. A parsed value takes far more memory than its text, so pdf-defuse reads an object as damaged when its values would take more than about 16 MB, not counting the text of names and strings. It keeps at most about 32 MB of parsed objects for reuse. The dictionaries of streams written inside other objects stay for the whole run, up to about 32 MB more, and an object whose streams would pass that reads as damaged.
+
+pdf-defuse parses an object in a window that starts at 4 KB and grows as the parser needs more. Runs of whitespace and comments, stream bodies inside the object and the line after a `stream` keyword are skipped in the source instead of read into the window, so padding costs time but not memory. After 64 skips in one object, the window takes in the rest of it, up to 256 MB.
+
+Each object stream is decoded once, the first time an object in it is read. Decoded object streams share `memoryThreshold` of memory. The least recently used move to a temporary file when they need more, and a stream larger than `memoryThreshold` gets a file of its own. Time and temporary space grow with the decoded size of the object streams read. `limits.decompressedBytes` caps each stream, and `limits.timeMs` the run.
 
 Free rows in a cross-reference section cost a few numbers per run of them, since a few kilobytes of xref stream can free millions of object numbers. Only rows that an older section could use are held one by one. When those outnumber both 65,536 and the live objects, pdf-defuse rebuilds the table by scanning and reports CORRUPTED/XREF_REBUILT. `limits.objects` counts live rows only, in a table and in a stream alike.
 
@@ -293,9 +311,13 @@ Measured with Node 24. The heap cap is `--max-old-space-size`, and the semi-spac
 | File | Size | Objects | Heap cap | Result |
 |---|---|---|---|---|
 | Generated, one large stream | 100 MB | 4 | 48 MB | Defused |
-| ISO 32000-1 specification | 22 MB | 127,000 | 48 MB | Defused, about 200 MB resident |
-| ISO 32000-1 specification | 22 MB | 127,000 | 48 MB, 2 MB semi-space | Defused, about 125 MB resident |
-| ISO 32000-1 specification | 22 MB | 127,000 | Node default | Defused, about 350 MB resident |
+| A 756-page manual | 22 MB | 127,000 | 48 MB | Defused, about 200 MB resident |
+| A 756-page manual | 22 MB | 127,000 | 48 MB, 2 MB semi-space | Defused, about 125 MB resident |
+| A 756-page manual | 22 MB | 127,000 | Node default | Defused, about 350 MB resident |
+| Generated, objects alternating across 9 object streams of 1 MB each decoded | 400 KB | 18,000 | Node default | Defused in 1 s |
+| Generated, the same across 64 object streams | 760 KB | 32,000 | 48 MB | Defused in 3 s, about 190 MB resident |
+| Generated, 16 object streams of 32 MB each decoded | 560 KB | 1,600 | 48 MB | Defused in 5 s, about 100 MB resident, with 512 MB of temporary files |
+| Generated, an object stream whose last object never closes, then 128 MB of spaces decoded | 130 KB | 8 | 48 MB | Defused in 1 s, about 95 MB resident |
 
 ## What it does not protect against
 
@@ -305,7 +327,7 @@ Measured with Node 24. The heap cap is `--max-old-space-size`, and the semi-spac
 
 ## Development
 
-Development needs Node 22.12 or later. mocha 12 requires it, and the CommonJS test build loads chai 6, an ES module, with `require()`, which Node 22 supports only from 22.12. The pre-commit hook needs Node 22.22.1 or later for lint-staged. The published package has no runtime dependencies and runs on any Node 22.
+Development needs Node 22.12 or later. mocha 12 requires it, and the CommonJS test build loads chai 6, an ES module, with `require()`, which Node 22 supports only from 22.12. The pre-commit hook needs Node 22.22.1 or later for lint-staged. The published package has no runtime dependencies and runs on Node 18 or later.
 
 ```sh
 npm install --ignore-scripts
@@ -316,6 +338,8 @@ npm run format
 ```
 
 `npm run build` compiles `src` into `dist`. `npm test` runs the lint, builds the package and the tests, then runs mocha, so a lint error fails the tests. `npm run lint` runs `biome check` over the whole tree and changes nothing. `npm run format` rewrites files in Biome's format.
+
+`test/fixtures/cases` holds one small PDF for each problem a review found. `node scripts/make-fixtures.js` writes every fixture from scratch, and a second run writes the same bytes. It needs qpdf and the test build from `npm run build:test`. `manifest.json` in that folder gives each fixture's password and options, the verdicts inspect and disarm must return, and what release 0.1.2 returned. `test/cases.test.ts` checks those verdicts for every entry. It also checks with pdf.js that no script, attached file or outside action is left in the output, and that the output's pages hold the text pdf.js finds in the input. Set `PDF_DEFUSE_BEFORE` to the `index.js` of a 0.1.2 build and it checks what 0.1.2 returned too. For a new problem, add a fixture to the script and an entry to the manifest.
 
 `npx husky` activates the pre-commit hook. A plain `npm install` does the same through the `prepare` script. The hook runs Biome on the staged files, applying its safe fixes, then runs `npm audit`. The commit stops if either one fails.
 

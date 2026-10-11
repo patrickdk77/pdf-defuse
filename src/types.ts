@@ -24,6 +24,8 @@ export enum PdfDetail {
   UserPassword = 'USER_PASSWORD',
   OwnerPassword = 'OWNER_PASSWORD',
   PasswordRequired = 'PASSWORD_REQUIRED',
+  AttachmentsOnly = 'ATTACHMENTS_ONLY',
+  NoKey = 'NO_KEY',
   CertificateHandler = 'CERTIFICATE_HANDLER',
   UnknownHandler = 'UNKNOWN_HANDLER',
   UnknownCryptFilter = 'UNKNOWN_CRYPT_FILTER',
@@ -41,6 +43,7 @@ export enum PdfDetail {
   StreamLengthWrong = 'STREAM_LENGTH_WRONG',
   LeadingBytes = 'LEADING_BYTES',
   TrailingBytes = 'TRAILING_BYTES',
+  MissingHeader = 'MISSING_HEADER',
   // JAVASCRIPT
   Document = 'DOCUMENT',
   OpenAction = 'OPEN_ACTION',

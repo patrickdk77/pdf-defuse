@@ -1,0 +1,1365 @@
+{
+  "about": [
+    "Each file reproduces one problem a review found. scripts/make-fixtures.js writes every file from scratch.",
+    "expected is what inspectPdf and disarmPdf return with the password and options given. kinds lists the findings that strip or reject, info the ones that only report.",
+    "output lists what pdf.js may still find in the defused file. By default that is no attached file, no link, and the page text pdf.js finds in the input.",
+    "before is what release 0.1.2 returned for the same input and options, so the fixtures for the 0.2.0 fixes fail there."
+  ],
+  "files": {
+    "prev-negative-unreadable.pdf": {
+      "issue": "An update whose trailer has /Prev -200, over a catalog that does not parse. 0.1.2 stopped the run with an I/O error, reading before the start of the file. It now rejects the file as UNPARSEABLE, as pdf.js does.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": null,
+        "error": "Error: The source returned 0 bytes at offset -65536 where 65536 were expected"
+      }
+    },
+    "xrefstm-negative-unreadable.pdf": {
+      "issue": "The same file with /XRefStm -1 in place of /Prev. 0.1.2 stopped with the same error, and the file is now rejected the same way.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": null,
+        "error": "Error: The source returned 0 bytes at offset -65536 where 65536 were expected"
+      }
+    },
+    "prev-negative.pdf": {
+      "issue": "A readable file with an empty update whose /Prev is -200. 0.1.2 stopped with the same I/O error. pdf-defuse now rebuilds the cross-reference map by scanning and defuses the file, as pdf.js and qpdf read it.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": null,
+        "error": "Error: The source returned 0 bytes at offset -65536 where 65536 were expected"
+      }
+    },
+    "xrefstm-negative.pdf": {
+      "issue": "A readable file whose trailer has /XRefStm -1. 0.1.2 stopped with the I/O error. pdf-defuse now reports a /XRefStm that leads to no xref stream as MALFORMED_OBJECT and defuses the file.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": null,
+        "error": "Error: The source returned 0 bytes at offset -65536 where 65536 were expected"
+      }
+    },
+    "objstm-offset-negative.pdf": {
+      "issue": "An object stream whose header puts object 6 forty bytes before /First. Read with memoryThreshold 0, so the stream spills to a temporary file, 0.1.2 threw a RangeError from the file read. It is now MALFORMED_OBJECT.",
+      "options": {
+        "memoryThreshold": 0
+      },
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"],
+        "info": ["PROCESSING/MEMORY_FALLBACK"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": null,
+        "error": "RangeError: The value of \"position\" is out of range. It must be >= -1 && <= 9007199254740991. Received -65536"
+      }
+    },
+    "length-fractional.pdf": {
+      "issue": "Page content whose /Length is 36.5. In 0.1.2 disarm stopped with an error asking the source for 36.5 bytes. pdf-defuse now reads to endstream, as pdf.js does, and reports STREAM_LENGTH_WRONG.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/STREAM_LENGTH_WRONG"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "clean",
+        "pages": 1,
+        "kinds": [],
+        "error": "Error: The source returned 36 bytes at offset 345 where 36.5 were expected"
+      }
+    },
+    "update-frees-content.pdf": {
+      "issue": "An update that frees the page content and gives it generation 1. In 0.1.2 disarm wrote null for the freed /Contents and then failed its own output check with VERIFICATION_FAILED.",
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": ["STRUCTURE/INCREMENTAL_UPDATES"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "rejected",
+        "pages": 1,
+        "kinds": ["STRUCTURE/INCREMENTAL_UPDATES"]
+      }
+    },
+    "page-contents-annots-null.pdf": {
+      "issue": "A page whose /Contents and /Annots are null. 0.1.2 reported both as MALFORMED_OBJECT. A null there is allowed, and the file is now clean.",
+      "expected": {
+        "status": "clean",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": [],
+        "info": [],
+        "disarm": "clean"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"]
+      }
+    },
+    "page-annots-missing-object.pdf": {
+      "issue": "A page whose /Annots refers to an object the file does not have. The 0.1.2 rewrite wrote null there and its output check rejected the file with VERIFICATION_FAILED. It is now clean.",
+      "expected": {
+        "status": "clean",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": [],
+        "info": [],
+        "disarm": "clean"
+      },
+      "before": {
+        "status": "clean",
+        "disarm": "rejected",
+        "pages": 1,
+        "kinds": []
+      }
+    },
+    "r6-password-unicode32.pdf": {
+      "issue": "Revision 6, encrypted with Password U+5F33 !, the Unicode 3.2 form of U+2F874. Typed with U+2F874, the password opens it only after SASLprep, which 0.1.2 did not apply. pdf.js maps U+2F874 to U+5F53 and fails here.",
+      "password": "Password\ud87e\udc74!",
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/USER_PASSWORD"],
+        "info": ["ENCRYPTED/AES_256"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "r6-password-corrigendum4.pdf": {
+      "issue": "Revision 6, encrypted with Password U+5F53 !, the form after Unicode Corrigendum #4. Typed with U+2F874, SASLprep against Unicode 3.2 gives U+5F33, so under ISO 32000-2 this password does not open it. pdf.js normalizes with later Unicode tables, gets U+5F53 and opens it. pdf-defuse tries the same forms as pdf.js since the fourth review of 0.2.0, so it opens the file too.",
+      "password": "Password\ud87e\udc74!",
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/USER_PASSWORD"],
+        "info": ["ENCRYPTED/AES_256"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "r6-password-unnormalized.pdf": {
+      "issue": "Revision 6, encrypted with U+AC00 U+0323 U+0300. The password typed as U+AC00 U+0300 U+0323 opens it once normalization reorders the two marks. 0.1.2 used the typed bytes and failed.",
+      "password": "\uac00\u0300\u0323",
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/USER_PASSWORD"],
+        "info": ["ENCRYPTED/AES_256"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "r6-password-saslprep.pdf": {
+      "issue": "Revision 6, encrypted with SaSLprep. The password typed with U+00AA for the a and a soft hyphen opens it, since SASLprep maps U+00AA to a and drops U+00AD. 0.1.2 failed.",
+      "password": "S\u00aaSL\u00adprep",
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/USER_PASSWORD"],
+        "info": ["ENCRYPTED/AES_256"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "brotli-objstm.pdf": {
+      "issue": "PDF 2.0 with a BrotliDecode xref stream, object stream and page content. 0.1.2 could not decode them and found no catalog. It is now clean.",
+      "expected": {
+        "status": "clean",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": [],
+        "info": [],
+        "disarm": "clean"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "brotli-objstm-script.pdf": {
+      "issue": "The same layout with an open-action script inside the Brotli object stream. 0.1.2 rejected the file unread. pdf-defuse now finds the script and removes it.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "brotli-predictor.pdf": {
+      "issue": "An object stream holding the catalog and a script, under BrotliDecode with a PNG predictor. Readers apply a predictor after Brotli differently, so pdf-defuse refuses to decode it and rejects the file. pdf.js does not open it either. 0.1.2 rejected it too, since it decoded no Brotli at all.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "brotli-twice.pdf": {
+      "issue": "An object stream holding the catalog and a script, under [/BrotliDecode /BrotliDecode]. pdf-defuse refuses a chain with two BrotliDecode filters and rejects the file. pdf.js reads it and runs the script. 0.1.2 rejected it too, since it decoded no Brotli at all.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "root-direct.pdf": {
+      "issue": "The trailer /Root is a dictionary, the page sits inside /Kids, there is no cross-reference table and the content stream has no /Length. 0.1.2 found no catalog and rejected the file. pdf-defuse now reads it as pdf.js does.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "root-direct-xref.pdf": {
+      "issue": "An empty cross-reference table, and the whole document, open-action script included, written in the trailer /Root. 0.1.2 found no catalog. pdf-defuse now finds the script and removes it.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "header-missing.pdf": {
+      "issue": "No %PDF- header in the first 1024 bytes. 0.1.2 refused the file as not a PDF. pdf-defuse now reads it, reports MISSING_HEADER and writes a header.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MISSING_HEADER", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "header-missing-unreadable.pdf": {
+      "issue": "No header, in a file that stays unreadable because its only page never closes. pdf-defuse rejects it with no pages, now after reading it. pdf.js counts a page it cannot load.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": 0,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/MISSING_HEADER", "CORRUPTED/UNPARSEABLE", "CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "not-a-pdf.pdf": {
+      "issue": "Plain text with a .pdf name. With no header and no PDF structure, pdf-defuse rejects it as UNPARSEABLE, as before.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "trailer-cut.pdf": {
+      "issue": "The end of the file cuts the trailer dictionary off, and the catalog has no /Type. 0.1.2 dropped the cut trailer and rejected the file. pdf-defuse now reads the trailer as far as it goes, as pdf.js does, and removes the open-action script.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/XREF_REBUILT", "JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "header-missing-trailer-cut-root-direct.pdf": {
+      "issue": "No header, a trailer the end of the file cuts off, and the page tree written inside that trailer. 0.1.2 refused it as not a PDF.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/MISSING_HEADER", "CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "pages-entry-free.pdf": {
+      "issue": "The catalog resolves but the /Pages row is free. 0.1.2 rejected the file with No page tree. pdf-defuse now rebuilds the map by scanning, as pdf.js does.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "pages-entry-bad-offset.pdf": {
+      "issue": "The /Pages row gives offset 4294967295. 0.1.2 rejected it the same way, and pdf-defuse now rebuilds the map the same way.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "page-entry-swapped.pdf": {
+      "issue": "The rows of the page and its content are swapped, so the first page resolves to a stream. 0.1.2 rejected the file with no pages. pdf-defuse now rebuilds the map, as pdf.js does for the first page.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": 0,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/UNPARSEABLE", "STRUCTURE/UNREFERENCED_OBJECTS"]
+      }
+    },
+    "page-last-entry-wrong.pdf": {
+      "issue": "The row of the second of two pages points at the font. 0.1.2 dropped that page and kept one. pdf-defuse now rebuilds the map and keeps both.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 2,
+        "kinds": ["CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "STRUCTURE/SHADOWED_OBJECTS", "STRUCTURE/UNREFERENCED_OBJECTS"]
+      }
+    },
+    "prev-loop.pdf": {
+      "issue": "The newest section points /Prev at itself and redefines the catalog, so the page tree in the older section has no entry. 0.1.2 rejected the file with No page tree.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/XREF_REBUILT", "STRUCTURE/SHADOWED_OBJECTS"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "dict-stray-r.pdf": {
+      "issue": "A stray R where the page dictionary's first key belongs. 0.1.2 could not read the page and rejected the file. pdf-defuse now skips the R as pdf.js does, reads the page and removes its open script.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "JAVASCRIPT/PAGE"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": 0,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/UNPARSEABLE", "JAVASCRIPT/UNATTACHED", "STRUCTURE/UNREFERENCED_OBJECTS"]
+      }
+    },
+    "direct-stream.pdf": {
+      "issue": "An image stream written inside the /Pages resources. 0.1.2 could not parse /Pages and rejected the file. pdf-defuse now reads the stream and writes it as an object of its own.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "direct-stream-length-short.pdf": {
+      "issue": "Page content written inside the page, whose /Length ends before Tj. This is a debatable choice. endstream does not follow the /Length, so pdf-defuse reads to the first endstream and keeps the whole text, as pdf.js does. 0.1.2 rejected the file.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "output": {
+        "text": "Hello, direct stream"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": 0,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/UNPARSEABLE", "STRUCTURE/UNREFERENCED_OBJECTS"]
+      }
+    },
+    "objstm-type-other.pdf": {
+      "issue": "An object stream whose /Type is /Potato. 0.1.2 would not read objects from it and found no catalog. pdf-defuse now reads it, as pdf.js does, and reports the /Type.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "attachments-only.pdf": {
+      "issue": "Revision 6 encrypting only the attached file, through a crypt filter with /AuthEvent /EFOpen, with strings and streams under Identity. 0.1.2 asked for the password. pdf-defuse now opens it, as pdf.js does, and removes the file it cannot decrypt. The user password is attachment.",
+      "expected": {
+        "status": "strippable",
+        "risk": "MEDIUM",
+        "pages": 1,
+        "kinds": ["EMBEDDED_FILE/NO_PLUGIN", "ENCRYPTED/ATTACHMENTS_ONLY"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "attachments-only-script.pdf": {
+      "issue": "The same encryption with a document script, which Identity leaves in plain text, and two attached files. pdf-defuse removes the script and both files.",
+      "expected": {
+        "status": "strippable",
+        "risk": "CRITICAL",
+        "pages": 1,
+        "kinds": ["EMBEDDED_FILE/NO_PLUGIN", "ENCRYPTED/ATTACHMENTS_ONLY", "JAVASCRIPT/DOCUMENT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "r6-owner-empty.pdf": {
+      "issue": "Revision 6 whose owner password is empty and whose user password is not. 0.1.2 tried the empty password only as the user password and rejected the file. pdf-defuse now opens it as the owner, as qpdf does. pdf.js asks for a password.",
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/OWNER_PASSWORD"],
+        "info": ["ENCRYPTED/AES_256"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "root-direct-stream-in-trailer.pdf": {
+      "issue": "A catalog in the trailer of a cross-reference table, whose open action holds its script as a stream written inside it. 0.1.2 rejected the file, and so did 0.2.0 before its review, which read no stream in that trailer. pdf.js runs the script, and pdf-defuse now finds it and removes it.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "objstm-direct-stream-script.pdf": {
+      "issue": "An open action in an object stream, whose script is a stream written inside it. 0.1.2 read the action as damaged and reported no script. pdf.js runs it, and pdf-defuse now reads the stream from the decoded object stream, reports the script and removes it.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"]
+      }
+    },
+    "objstm-page-direct-content.pdf": {
+      "issue": "A page in an object stream, whose content is a stream written inside it. 0.1.2 found no page and rejected the file. pdf.js shows the page, and pdf-defuse now reads its content from the decoded object stream.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "output": {
+        "text": "Hello"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": 0,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/UNPARSEABLE", "STRUCTURE/UNREFERENCED_OBJECTS"]
+      }
+    },
+    "pages-count-entry-wrong.pdf": {
+      "issue": "The page tree's /Count names object 6, whose row points at the page content. pdf.js reads that row looking for the first page and rebuilds the map, which takes a definition of the page that no row names and that runs a script when the page opens. 0.1.2 kept the map and missed the script, and pdf-defuse now rebuilds it as pdf.js does.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/XREF_REBUILT", "JAVASCRIPT/PAGE", "STRUCTURE/SHADOWED_OBJECTS"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "STRUCTURE/SHADOWED_OBJECTS"]
+      }
+    },
+    "pages-last-missing-entry-wrong.pdf": {
+      "issue": "/Count gives two pages, and the node that holds the second claims none, so pdf.js does not find the last page where /Count puts it. It then reads every page, meets a row that points at the font, and rebuilds the map, which finds a second page that runs a script when it opens. 0.1.2 saw one page and missed the script.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 2,
+        "kinds": ["CORRUPTED/XREF_REBUILT", "JAVASCRIPT/PAGE"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "STRUCTURE/SHADOWED_OBJECTS"]
+      }
+    },
+    "pages-kids-loop.pdf": {
+      "issue": "Each kid of the page tree names the array that holds it, and pdf.js loops on it. 0.1.2 rejected the file at once. 0.2.0 before its review queued every kid of every visit until the process ran out of memory. The page lookups now stop after a fixed number of steps, and the file is rejected as before.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": 0,
+        "kinds": ["CORRUPTED/UNPARSEABLE"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": 0,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "trailers-competing.pdf": {
+      "issue": "Two trailers, each with a catalog leading to its own page tree. pdf.js's recovery scan goes from the first trailer to the next startxref and never reaches the second, so it shows First trailer. pdf-defuse picks the trailer the same way since the fourth review of 0.2.0. 0.1.2 rejected the file.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT", "STRUCTURE/UNREFERENCED_OBJECTS"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "output": {
+        "text": "First trailer"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "script-pdfjs-unreadable.pdf": {
+      "issue": "An open-action script in a file pdf.js does not open: one object, and a trailer catalog whose page sits inside /Kids. pdf-defuse reads it, finds the script and removes it. 0.1.2 rejected the file.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/XREF_REBUILT", "JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "unreadable-truncated.pdf": {
+      "issue": "A correct rejection: the file ends inside the page tree, with no trailer. pdf.js cannot open it either.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "root-invalid.pdf": {
+      "issue": "A correct rejection: the trailer /Root points at a number and no catalog exists. pdf.js reports an invalid Root reference.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "pages-cycle.pdf": {
+      "issue": "A correct rejection: the page tree lists itself as its only kid. pdf.js counts one page and cannot load it.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": 0,
+        "kinds": ["CORRUPTED/UNPARSEABLE"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": 0,
+        "kinds": ["CORRUPTED/UNPARSEABLE"]
+      }
+    },
+    "user-password.pdf": {
+      "issue": "A correct rejection: AES-128 with a real user password, opened with none. The user password is fixture-user.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "certificate-encryption.pdf": {
+      "issue": "A correct rejection: public-key encryption through Adobe.PubSec, which nothing opens without the recipient certificate. The recipient and content are placeholder bytes.",
+      "expected": {
+        "status": "rejected",
+        "risk": "UNKNOWN",
+        "pages": null,
+        "kinds": ["ENCRYPTED/CERTIFICATE_HANDLER"],
+        "info": [],
+        "disarm": "rejected"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/CERTIFICATE_HANDLER"]
+      }
+    },
+    "js-open-page-close.pdf": {
+      "issue": "Scripts on open, on page open, and on close through an action whose /S is an empty name. pdf-defuse removes all three.",
+      "expected": {
+        "status": "strippable",
+        "risk": "CRITICAL",
+        "pages": 1,
+        "kinds": ["ACTION/UNKNOWN", "JAVASCRIPT/OPEN_ACTION", "JAVASCRIPT/PAGE", "JAVASCRIPT/UNATTACHED"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["ACTION/UNKNOWN", "JAVASCRIPT/OPEN_ACTION", "JAVASCRIPT/PAGE", "JAVASCRIPT/UNATTACHED"]
+      }
+    },
+    "will-close-empty-s.pdf": {
+      "issue": "Only the will-close script with an empty /S, in a tiny file with the catalog in the trailer. pdf-defuse reports ACTION/UNKNOWN and JAVASCRIPT/UNATTACHED and removes it. 0.1.2 rejected the file.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["ACTION/UNKNOWN", "CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/XREF_REBUILT", "JAVASCRIPT/UNATTACHED"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "js-open-action-tiny.pdf": {
+      "issue": "An open-action script in a file with a comment before the header, the catalog in the trailer and no cross-reference table. 0.1.2 rejected the file. pdf-defuse now removes the script.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/XREF_REBUILT", "JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "js-stream-filter.pdf": {
+      "issue": "The open-action script in an ASCII85 stream with no /Length. pdf-defuse decodes it, reports the script and removes it. 0.1.2 rejected the file.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT", "JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "js-encoded-names.pdf": {
+      "issue": "An open-action script whose names are written with #xx escapes and whose text uses octal escapes and backslash-newline breaks, and page text in the same encodings. pdf-defuse finds and removes the script, and reports the escaped names.",
+      "expected": {
+        "status": "strippable",
+        "risk": "CRITICAL",
+        "pages": 1,
+        "kinds": ["JAVASCRIPT/OPEN_ACTION"],
+        "info": ["STRUCTURE/ESCAPED_NAMES"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["JAVASCRIPT/OPEN_ACTION"]
+      }
+    },
+    "launch-win.pdf": {
+      "issue": "A Launch action on open whose program is under /Win. pdf.js reports nothing for it. pdf-defuse removes it. The program name is a placeholder.",
+      "expected": {
+        "status": "strippable",
+        "risk": "CRITICAL",
+        "pages": 1,
+        "kinds": ["ACTION/LAUNCH", "ACTION/TRIGGERED"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["ACTION/LAUNCH", "ACTION/TRIGGERED"]
+      }
+    },
+    "xfa-event-script.pdf": {
+      "issue": "An XFA form whose field runs a script on its initialize event. pdf.js does not show XFA scripts. pdf-defuse removes the XFA.",
+      "expected": {
+        "status": "strippable",
+        "risk": "MEDIUM",
+        "pages": 1,
+        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT", "FORM/XFA"],
+        "info": ["FORM/FIELDS"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "polyglot-pe.pdf": {
+      "issue": "The shape of a PE/PDF polyglot: marker bytes starting with MZ where the executable would be, then a PDF with the catalog in the trailer. pdf-defuse strips the leading bytes.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "polyglot-zip.pdf": {
+      "issue": "The shape of a PDF/ZIP polyglot: a stored ZIP archive of one text file after %%EOF. pdf-defuse strips the trailing bytes.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/TRAILING_BYTES"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/TRAILING_BYTES"]
+      }
+    },
+    "efail-layout.pdf": {
+      "issue": "The EFAIL block layout: 16-byte lines of PDF, each ending in a comment that swallows the next block of unknown bytes. It holds no channel out, so only the layout damage is reported.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/XREF_REBUILT"]
+      }
+    },
+    "efail-exfil.pdf": {
+      "issue": "The same layout with a channel out: the page submits the form to a placeholder host when it opens. pdf-defuse removes the SubmitForm action.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["ACTION/SUBMIT_FORM", "ACTION/TRIGGERED", "CORRUPTED/LEADING_BYTES", "CORRUPTED/XREF_REBUILT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["ACTION/SUBMIT_FORM", "ACTION/TRIGGERED", "CORRUPTED/LEADING_BYTES", "CORRUPTED/XREF_REBUILT"]
+      }
+    },
+    "link-ip-host.pdf": {
+      "issue": "A link to a bare IP address, from the documentation range 192.0.2.0/24. pdf-defuse removes it as LINK/IP_HOST.",
+      "expected": {
+        "status": "strippable",
+        "risk": "MEDIUM",
+        "pages": 1,
+        "kinds": ["LINK/IP_HOST"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["LINK/IP_HOST"]
+      }
+    },
+    "link-phishing-https.pdf": {
+      "issue": "A phishing-style link over https to a host under the reserved .example name. pdf-defuse keeps https links and reports it as LINK/SAFE, so the file is clean. An override of LINK/SAFE to strip removes it.",
+      "expected": {
+        "status": "clean",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": [],
+        "info": ["LINK/SAFE"],
+        "disarm": "clean"
+      },
+      "output": {
+        "links": ["https://account-verify.example/signin"]
+      },
+      "before": {
+        "status": "clean",
+        "disarm": "clean",
+        "pages": 1,
+        "kinds": []
+      }
+    },
+    "incremental-replace.pdf": {
+      "issue": "An update replaces the page content. The older definition counts under INCREMENTAL_UPDATES. Before 0.1.0 the shadowed-object scan counted it a second time.",
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": ["STRUCTURE/INCREMENTAL_UPDATES"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "output": {
+        "text": "New"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["STRUCTURE/INCREMENTAL_UPDATES"]
+      }
+    },
+    "xref-offsets-early.pdf": {
+      "issue": "Every cross-reference offset is one byte early, on the newline before its object, as Microsoft Print to PDF writes them. Before 0.1.0 the shadowed-object scan flagged every object. The file is clean.",
+      "expected": {
+        "status": "clean",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": [],
+        "info": [],
+        "disarm": "clean"
+      },
+      "before": {
+        "status": "clean",
+        "disarm": "clean",
+        "pages": 1,
+        "kinds": []
+      }
+    },
+    "attached-csv-formula.pdf": {
+      "issue": "An attached CSV file with a formula cell the CSV plugin escapes, so the plugin hands back new bytes. Before 0.1.0 the writer compressed them through require(\"node:stream\").promises, which the command-line tool had emptied by loading node:stream/promises first, and defuse rejected the file with VERIFICATION_FAILED.",
+      "options": {
+        "filePlugins": ["csv"]
+      },
+      "cli": {
+        "args": ["--scrub-attached-csv"],
+        "exitCode": 1
+      },
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": [],
+        "info": ["EMBEDDED_FILE/PLUGIN_SCRUBBED"],
+        "disarm": "defused"
+      },
+      "output": {
+        "attachments": ["report.csv"]
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": []
+      }
+    },
+    "r6-password-raw.pdf": {
+      "issue": "Revision 6, encrypted with the bytes of pw U+E000, as qpdf encrypts it. SASLprep refuses that password for its private-use character. 0.1.2 and pdf.js open the file with the password as typed. 0.2.0 before its fourth review tried the SASLprep form alone and asked for a password.",
+      "password": "pw\ue000",
+      "expected": {
+        "status": "strippable",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/USER_PASSWORD"],
+        "info": ["ENCRYPTED/AES_256"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/USER_PASSWORD"]
+      }
+    },
+    "trailer-in-comment.pdf": {
+      "issue": "The newest trailer sits in a comment and names another page tree. pdf.js skips comments when it rebuilds the cross-reference table and shows Real trailer. 0.2.0 before its fourth review took the commented trailer. 0.1.2 rejected the file.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT", "STRUCTURE/UNREFERENCED_OBJECTS"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "output": {
+        "text": "Real trailer"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["CORRUPTED/TRUNCATED"]
+      }
+    },
+    "hybrid-free-row.pdf": {
+      "issue": "A cross-reference table marks object 6 free, and its /XRefStm stream gives object 6, an open-action script. pdf.js keeps the free row and runs no script. qpdf and 0.1.2 take the row from the stream. pdf-defuse now reads the table as pdf.js does, and reports the row and the definition only the stream names.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "STRUCTURE/SHADOWED_OBJECTS"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "JAVASCRIPT/OPEN_ACTION"]
+      }
+    },
+    "objstm-many-streams.pdf": {
+      "issue": "Objects alternate across nine object streams, each 1 MB once decoded. 0.1.2 kept eight decoded object streams, so every lookup decoded one again, and a 60 KB file in this shape took 31 seconds. pdf-defuse now decodes each object stream once. The verdict was always clean, and test/review/round7.test.ts measures the reads.",
+      "expected": {
+        "status": "clean",
+        "risk": "NONE",
+        "pages": 1,
+        "kinds": [],
+        "info": ["PROCESSING/MEMORY_FALLBACK"],
+        "disarm": "clean"
+      },
+      "before": {
+        "status": "clean",
+        "disarm": "clean",
+        "pages": 1,
+        "kinds": []
+      }
+    },
+    "objstm-padding.pdf": {
+      "issue": "The last object in an object stream never closes, and 16 MB of spaces follow it once decoded. 0.1.2 grew its parse window over the padding, and 128 MB of padding took 280 MB of memory. pdf-defuse now skips the padding in the decoded data without holding it. pdf.js loses the whole object stream and opens nothing.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"],
+        "info": ["PROCESSING/MEMORY_FALLBACK"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"]
+      }
+    },
+    "objstm-padding-stream.pdf": {
+      "issue": "As objstm-padding.pdf, with a stream written inside the last object that has no endstream. The search for endstream used to grow the parse window over the padding.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"],
+        "info": ["PROCESSING/MEMORY_FALLBACK"],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"]
+      }
+    },
+    "objstm-stream-member.pdf": {
+      "issue": "The page content and an open-action script are streams stored in an object stream. pdf.js reads them from the decoded data. 0.1.2 and 0.2.0 before its fourth review read only their dictionaries, so the output lost the page text with no finding. pdf-defuse now reads them and reports CORRUPTED/MALFORMED_OBJECT.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "output": {
+        "text": "Hello"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["JAVASCRIPT/OPEN_ACTION"]
+      }
+    },
+    "objstm-index-lookup.pdf": {
+      "issue": "The entry of object 6, an open-action script, gives index 1 of its object stream, whose header names objects 1 and 9. pdf.js reads index 1 and runs the script. 0.1.2 found no object 6. pdf-defuse now reads the object pdf.js reads.",
+      "expected": {
+        "status": "strippable",
+        "risk": "HIGH",
+        "pages": 1,
+        "kinds": ["JAVASCRIPT/OPEN_ACTION"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"]
+      }
+    },
+    "objstm-offsets-decrease.pdf": {
+      "issue": "Object 7, an open-action script, starts after object 8 in its object stream. pdf.js reads no object from 7 on, so it runs no script. 0.1.2 read 7 and reported the script. pdf-defuse now reads the header as pdf.js does.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "JAVASCRIPT/OPEN_ACTION"]
+      }
+    },
+    "attachments-only-content.pdf": {
+      "issue": "Only the attached files are encrypted, through a crypt filter with /AuthEvent /EFOpen, and the page content names that filter. pdf.js has no key for it and draws a blank page. 0.1.2 asked for the password, and 0.2.0 before its fourth review rejected the file. pdf-defuse now removes the content, reports ENCRYPTED/NO_KEY and keeps the page.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/ATTACHMENTS_ONLY", "ENCRYPTED/NO_KEY"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "attachments-only-content-typed.pdf": {
+      "issue": "As attachments-only-content.pdf, with page content typed /EmbeddedFile, which takes the attached files' filter. pdf.js cannot read the page's text and draws it blank.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["ENCRYPTED/ATTACHMENTS_ONLY", "ENCRYPTED/NO_KEY"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "rejected",
+        "disarm": "rejected",
+        "pages": null,
+        "kinds": ["ENCRYPTED/PASSWORD_REQUIRED"]
+      }
+    },
+    "stream-keyword-text.pdf": {
+      "issue": "Page content where text follows a \"stream\" keyword on its line. pdf.js starts the body after the line and shows Shown. Other readers, 0.1.2 and 0.2.0 before its fourth review start it right after the keyword and show Hidden as well. pdf-defuse now reads the body as pdf.js does and reports the text.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG"]
+      }
+    },
+    "endstream-misspelled.pdf": {
+      "issue": "Page content with a wrong /Length whose body ends at endsteam, a misspelling pdf.js takes for endstream, and more text after it. pdf.js shows Shown. 0.1.2 and 0.2.0 before its fourth review searched for endstream alone and showed Hidden as well. pdf-defuse now ends the body where pdf.js does.",
+      "expected": {
+        "status": "strippable",
+        "risk": "LOW",
+        "pages": 1,
+        "kinds": ["CORRUPTED/STREAM_LENGTH_WRONG"],
+        "info": [],
+        "disarm": "defused"
+      },
+      "before": {
+        "status": "strippable",
+        "disarm": "defused",
+        "pages": 1,
+        "kinds": ["CORRUPTED/STREAM_LENGTH_WRONG"]
+      }
+    }
+  }
+}

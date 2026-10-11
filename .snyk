@@ -1,0 +1,6 @@
+# Snyk (https://snyk.io) policy file
+# scripts/ and test/ are not in the published package, so Snyk Code checks only what ships.
+exclude:
+  code:
+    - scripts/**
+    - test/**

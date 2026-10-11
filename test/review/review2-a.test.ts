@@ -165,8 +165,8 @@ describe('review: round 2, parser, filters and the checks they feed', function (
       expect(await noScriptLeft(out)).to.deep.equal(REMOVED);
     });
 
-    it("reports text between 'stream' and its EOL, where pdf.js starts the body later", async () => {
-      // This package starts the object stream at " 6 107", pdf.js after the EOL, 7 bytes on.
+    it("reports text between 'stream' and its EOL, and starts the body after the EOL as pdf.js does", async () => {
+      // pdf.js and this package start the object stream after the EOL, 7 bytes on. Other readers start it at " 6 107".
       const body = placed(160, [
         [0, '6 0'],
         [20, SCRIPT],
@@ -178,7 +178,7 @@ describe('review: round 2, parser, filters and the checks they feed', function (
       const seen: string[] = [];
       const p = new Parser(Buffer.from('<< >>\nstream x\nabc'), 0, true, { onBadToken: t => seen.push(t) });
       p.parseObject();
-      expect({ start: p.streamStart(), seen }).to.deep.equal({ start: 12, seen: ['stream'] });
+      expect({ start: p.streamStart(), seen }).to.deep.equal({ start: 15, seen: ['stream'] });
     });
 
     it('reports a malformed number, which pdf.js reads as another value', async () => {

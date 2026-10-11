@@ -316,7 +316,10 @@ describe('review: document', () => {
     const limits = { limits: { decompressedBytes: 1 << 20 } };
     for (const badStartxref of [false, true]) {
       const i = await inspectPdf(build({ ...layout, badStartxref }), limits);
-      expect({ badStartxref, status: i.status, kinds: kinds(i) }).to.deep.equal({ badStartxref, status: 'rejected', kinds: [`${C.Limit}/${D.DecompressedSize}`] });
+      // The rebuilt map reads like pdf.js's, which finds the object stream through the xref stream, so the limit stops
+      // the walk and the rebuild is reported with it.
+      const limit = `${C.Limit}/${D.DecompressedSize}`;
+      expect({ badStartxref, status: i.status, kinds: kinds(i) }).to.deep.equal({ badStartxref, status: 'rejected', kinds: badStartxref ? [`${C.Corrupted}/${D.XrefRebuilt}`, limit] : [limit] });
     }
   });
 

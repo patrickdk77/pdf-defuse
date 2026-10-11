@@ -316,6 +316,8 @@ export class Walker {
   private readonly inlinePages = new Map<string, { index: number; box?: number[] }>();
   /** Objects first reached as file specifications, which stay file specifications whatever their content says. */
   private readonly fileRole = new Set<number>();
+  /** Page content streams, which pdf.js draws whatever their /Type says. */
+  private readonly contentRole = new Set<number>();
   /** Objects listed in /Annots and kept there though they are not annotations, which get the annotation rules. */
   private readonly annotRole = new Set<number>();
   /** Objects that only removed content refers to, which are not unreferenced. */
@@ -795,6 +797,9 @@ export class Walker {
         this.pageOrder.push(page);
         if (slot) this.inlinePages.set(slot, { index, box });
       }
+      const contents = own?.get('Contents');
+      const parts = contents instanceof PdfRef ? await this.doc.getObject(contents) : contents;
+      for (const c of Array.isArray(parts) ? parts : [contents]) if (c instanceof PdfRef) this.contentRole.add(c.num);
       // Many pages can share one /Annots array, or inherit one. Each array is keyed by the owner and path the walk
       // reaches it at: the last reference that leads to it, or the dictionary that holds it.
       const annots = await read('Annots');
@@ -980,7 +985,8 @@ export class Walker {
         this.strippedMeta.has(num) ||
         filterRefs.has(num) ||
         doc.encryptRefs.has(num) ||
-        doc.encryptRef?.num === num
+        doc.encryptRef?.num === num ||
+        doc.issues.objStmType.has(num)
       )
         continue;
       doc.checkTime();
@@ -1036,7 +1042,8 @@ export class Walker {
             this.doc.checkTime();
             if (!(x instanceof PdfRef)) continue;
             const s = await this.doc.getObject(x);
-            if (s instanceof PdfStream && classify(s) !== 'structural') total += await this.doc.plainLength(s, x.num);
+            // A stream that cannot be decrypted is not written, so it adds nothing.
+            if (s instanceof PdfStream && classify(s) !== 'structural' && this.doc.canDecrypt(s, x.num)) total += await this.doc.plainLength(s, x.num);
           }
           if (arrayNum !== undefined) shared.set(arrayNum, total);
         }
@@ -1085,8 +1092,16 @@ export class Walker {
       const info = d;
       if (special === 'info' && ['Author', 'Creator', 'Producer', 'Title', 'Subject', 'Keywords'].some(k => info.has(k)) && this.aggregate(C.Metadata, D.InfoDictionary).action === 'strip')
         return undefined;
-      // A stream decided as a contained file stays one, whether or not it says /Type /EmbeddedFile.
-      const kind = obj instanceof PdfStream && this.fileDecisions.has(num) ? 'efStream' : this.kindOf(obj, num, await this.actionType(d));
+      // A stream decided as a contained file stays one, whether or not it says /Type /EmbeddedFile, unless it is a page's
+      // content: only the reference that made it a contained file goes then.
+      let kind = obj instanceof PdfStream && this.fileDecisions.has(num) ? 'efStream' : this.kindOf(obj, num, await this.actionType(d));
+      if (kind === 'efStream' && this.contentRole.has(num)) kind = 'generic';
+      // Nothing reads a stream encrypted with a key the password does not give, and pdf.js draws a page without it.
+      // An attached file reports its own removal.
+      if (obj instanceof PdfStream && kind !== 'efStream' && kind !== 'structural' && !this.doc.canDecrypt(obj, num)) {
+        if (this.phase === 'A' && !ctx.shadow) this.emitRemoval(C.Encrypted, D.NoKey, ctx.location);
+        return undefined;
+      }
       switch (kind) {
         case 'structural':
           this.doc.issues.structuralRefs++;
@@ -1378,7 +1393,8 @@ export class Walker {
     for (const [k, v] of d.entries()) {
       const p = `${path}/${k}`;
       taken.add(k);
-      if (k === 'Annots') {
+      // A null /Annots or /Contents is the same as none. The writer puts null where a reference led to no object.
+      if (k === 'Annots' && v !== null) {
         let x: PdfObject | undefined;
         if (Array.isArray(v)) x = await this.handleAnnotsArray(v, pctx, owner, p);
         else if (v instanceof PdfRef) {
@@ -1394,7 +1410,7 @@ export class Walker {
       } else if (k === 'AA') {
         const x = await this.handleAA(v, { ...pctx, aaOwner: 'page' }, owner, p);
         if (x !== undefined) out.set(k, x);
-      } else if (k === 'Contents' && !node && !(v instanceof PdfRef) && !Array.isArray(v)) {
+      } else if (k === 'Contents' && !node && v !== null && !(v instanceof PdfRef) && !Array.isArray(v)) {
         const f = this.emit(C.Corrupted, D.MalformedObject, `${pctx.location} content`);
         if (f.action !== 'strip') {
           const x = await this.tv(v, pctx, owner, p);
@@ -1680,7 +1696,7 @@ export class Walker {
     // Only the first 4096 characters of a label are read. Many links can share one chain and one label, so the
     // outcome is kept per chain object and label.
     const labels = shownLabels.map(t => t?.slice(0, 4096));
-    const key = v instanceof PdfRef ? `${v.num}:${createHash('md5').update(JSON.stringify(labels)).digest('hex')}` : undefined;
+    const key = v instanceof PdfRef ? `${v.num}:${createHash('sha256').update(JSON.stringify(labels)).digest('hex')}` : undefined;
     let found = key === undefined ? undefined : this.labelChecks.get(key);
     if (found === undefined) {
       found = null;
@@ -2300,10 +2316,15 @@ export class Walker {
     const record = (keep: boolean, replacement?: SpillSink) => {
       this.fileDecisions.set(ref.num, { keep, replacement, types });
       // A stream something else reached first and kept goes too.
-      if (!keep && this.visited.has(ref.num)) this.dropped.add(ref.num);
+      if (!keep && this.visited.has(ref.num) && !this.contentRole.has(ref.num)) this.dropped.add(ref.num);
       return keep;
     };
     if (ctx.shadow) return false;
+    // No plugin can read a file whose key the password did not give, so it goes whatever the overrides say.
+    if (!this.doc.canDecrypt(st, ref.num)) {
+      this.emitRemoval(C.EmbeddedFile, D.NoPlugin, loc, { name: name ?? '', reason: 'encrypted' });
+      return record(false);
+    }
     const threshold = this.options.memoryThreshold ?? 8 * 1024 * 1024;
     // The first bytes alone stay in memory, however low the threshold.
     const decoded = new SpillSink(this.cfg.temp, whole ? threshold : Number.POSITIVE_INFINITY);
@@ -2553,6 +2574,7 @@ export class Walker {
     this.chainSites.clear();
     this.scriptFree.clear();
     this.fileRole.clear();
+    this.contentRole.clear();
     this.inlinePages.clear();
     return this.doc.release();
   }

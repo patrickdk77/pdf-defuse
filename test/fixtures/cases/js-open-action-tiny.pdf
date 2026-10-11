@@ -1,0 +1,10 @@
+% a script that runs on open
+
+%PDF-1.4
+
+1 0 obj
+<< /Type /Pages /Kids [<< /Type /Page /Parent 1 0 R /MediaBox [0 0 612 792] >>] /Count 1 >>
+endobj
+
+trailer
+<< /Root << /Pages 1 0 R /OpenAction << /S /JavaScript /JS (app.alert\("pdf-defuse fixture"\);) >> >> >>

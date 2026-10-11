@@ -1,0 +1,19 @@
+% This file has no PDF header.
+
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] /MediaBox [0 0 612 792] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< >>
+stream
+BT /F1 24 Tf 72 720 Td (Hello) Tj ET
+endstream
+endobj
+trailer
+<< /Root 1 0 R >>

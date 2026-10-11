@@ -1,0 +1,14 @@
+% an XFA form
+%PDF-1.4
+1 0 obj
+<< >>
+stream
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">
+<template><subform name="form"><pageSet/><field name="greeting"><event activity="initialize">
+<script contentType="application/x-javascript">app.alert("pdf-defuse fixture");</script>
+</event></field></subform></template>
+</xdp:xdp>
+endstream
+endobj
+trailer
+<< /Root << /AcroForm << /Fields [<< /T (form) /Kids [<< /Subtype /Widget /FT /Btn /T (greeting) /Rect [0 0 0 0] >>] >>] /XFA 1 0 R >> /Pages << >> >> >>

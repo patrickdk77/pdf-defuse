@@ -58,8 +58,8 @@ describe('document reading', () => {
     expect(await doc.getObject(new PdfRef(6, 0))).to.equal(null);
   });
 
-  it('reads hybrid files whose xref table defers to an xref stream', async () => {
-    // Table lists object 6 as free; the XRefStm says it lives in an object stream.
+  it('reads hybrid files whose xref table defers to an xref stream, and keeps a free row of the table as pdf.js does', async () => {
+    // Object 6 lives in an object stream that the XRefStm names. The table leaves it out, or marks it free.
     const b = new PdfBuilder();
     const doc0 = makeDoc({ catalog: '/Extra 6 0 R' });
     void b;
@@ -93,20 +93,26 @@ describe('document reading', () => {
       Buffer.from('\nendstream\nendobj\n'),
     ]);
     const tableAt = out.length;
-    // Classic table copied from the original, with 6 free and 7/8 listed.
+    // Classic table copied from the original, with 7/8 listed and 6 left out or free.
     const doc = await open(doc0.pdf);
-    let table = 'xref\n0 9\n0000000000 65535 f\r\n';
-    for (let n = 1; n <= 8; n++) {
-      if (n === 6) table += '0000000000 00000 f\r\n';
-      else if (n === 7) table += `${String(off7).padStart(10, '0')} 00000 n\r\n`;
-      else if (n === 8) table += `${String(off8).padStart(10, '0')} 00000 n\r\n`;
-      else table += `${String(must(doc.xref.get(n), `xref entry ${n}`) / 65536).padStart(10, '0')} 00000 n\r\n`;
+    const row = (n: number) =>
+      n === 7
+        ? `${String(off7).padStart(10, '0')} 00000 n\r\n`
+        : n === 8
+          ? `${String(off8).padStart(10, '0')} 00000 n\r\n`
+          : `${String(must(doc.xref.get(n), `xref entry ${n}`) / 65536).padStart(10, '0')} 00000 n\r\n`;
+    const head6 = `xref\n0 6\n0000000000 65535 f\r\n${[1, 2, 3, 4, 5].map(row).join('')}`;
+    const tables = {
+      omitted: `${head6}7 2\n${row(7)}${row(8)}`,
+      free: `${head6}6 3\n0000000000 00000 f\r\n${row(7)}${row(8)}`,
+    };
+    const seen: Record<string, boolean> = {};
+    for (const [name, table] of Object.entries(tables)) {
+      const pdf = Buffer.concat([out, Buffer.from(`${table}trailer\n<< /Size 9 /Root 1 0 R /XRefStm ${off8} >>\nstartxref\n${tableAt}\n%%EOF\n`, 'latin1')]);
+      const hidden = await (await open(pdf)).getObject(new PdfRef(6, 0));
+      seen[name] = hidden instanceof PdfDict && hidden.has('Hidden');
     }
-    out = Buffer.concat([out, Buffer.from(`${table}trailer\n<< /Size 9 /Root 1 0 R /XRefStm ${off8} >>\nstartxref\n${tableAt}\n%%EOF\n`, 'latin1')]);
-    const hybrid = await open(out);
-    const hidden = (await hybrid.getObject(new PdfRef(6, 0))) as PdfDict;
-    expect(hidden).to.be.instanceOf(PdfDict);
-    expect(hidden.has('Hidden')).to.equal(true);
+    expect(seen).to.deep.equal({ omitted: true, free: false });
   });
 
   it('rebuilds the object map when startxref is wrong', async () => {

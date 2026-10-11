@@ -5,11 +5,23 @@ import * as path from 'node:path';
 import type { Writable } from 'node:stream';
 import type { ByteSink, ByteSource } from './types';
 
+/**
+ * The bytes [start, end) a read covers in a source of `size` bytes, or undefined when it covers none. Offsets read
+ * from a file can be negative or fractional, and such a read gets no bytes rather than bytes from somewhere else.
+ */
+function span(offset: number, length: number, size: number): [number, number] | undefined {
+  if (!Number.isSafeInteger(offset) || offset < 0 || offset >= size || !(length >= 1)) return undefined;
+  return [offset, Math.min(size, offset + Math.floor(length))];
+}
+
 /** A source over bytes already in memory. Reads return views, not copies. */
 export function bufferSource(bytes: Uint8Array): ByteSource {
   return {
     size: async () => bytes.length,
-    read: async (offset, length) => bytes.subarray(Math.max(0, offset), Math.min(bytes.length, offset + length)),
+    read: async (offset, length) => {
+      const s = span(offset, length, bytes.length);
+      return s ? bytes.subarray(s[0], s[1]) : new Uint8Array(0);
+    },
   };
 }
 
@@ -29,8 +41,10 @@ export function fileSource(filePath: string): ByteSource {
     },
     async read(offset, length) {
       const h = await open();
-      const total = await this.size();
-      const n = Math.max(0, Math.min(length, total - offset));
+      // Node reads position -1 from the file's current position, so a negative offset never reaches it.
+      const s = span(offset, length, await this.size());
+      if (!s) return Buffer.alloc(0);
+      const n = s[1] - offset;
       const buf = Buffer.allocUnsafe(n);
       let done = 0;
       while (done < n) {
@@ -164,10 +178,11 @@ export class Reader {
     return data;
   }
 
-  /** Reads up to `length` bytes at `offset`; shorter only at the end of the source. */
+  /** Reads up to `length` bytes at `offset`; shorter only at the end of the source, and empty outside it. */
   async read(offset: number, length: number): Promise<Uint8Array> {
-    if (offset >= this.size || length <= 0) return new Uint8Array(0);
-    const end = Math.min(this.size, offset + length);
+    const s = span(offset, length, this.size);
+    if (!s) return new Uint8Array(0);
+    const end = s[1];
     if (end - offset > this.blockSize * 4) return this.source.read(offset, end - offset);
     const first = Math.floor(offset / this.blockSize);
     const last = Math.floor((end - 1) / this.blockSize);
@@ -189,8 +204,10 @@ export class Reader {
 
   /** Yields the range in chunks without caching them. */
   async *chunks(offset: number, length: number, chunkSize = 262144): AsyncGenerator<Uint8Array> {
+    const s = span(offset, length, this.size);
+    if (!s) return;
     let pos = offset;
-    const end = Math.min(this.size, offset + length);
+    const end = s[1];
     while (pos < end) {
       const n = Math.min(chunkSize, end - pos);
       const c = await this.source.read(pos, n);
@@ -243,8 +260,11 @@ export class TempDir {
         }),
       read: (offset, length) =>
         keep(async () => {
-          const b = await source.read(offset, length);
-          const want = size === undefined ? b.length : Math.max(0, Math.min(length, size - offset));
+          // A read outside the source is not passed on: a caller's source, such as a ranged S3 request, may fail on it.
+          const s = span(offset, length, size ?? Number.MAX_SAFE_INTEGER);
+          if (!s) return new Uint8Array(0);
+          const b = await source.read(offset, s[1] - offset);
+          const want = size === undefined ? b.length : s[1] - offset;
           if (b.length !== want) throw Object.assign(new Error(`The source returned ${b.length} bytes at offset ${offset} where ${want} were expected`), { code: 'EIO' });
           return b;
         }),

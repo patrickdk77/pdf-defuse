@@ -1,5 +1,6 @@
 import * as crypto from 'node:crypto';
 import { PdfDict, PdfName, type PdfStream, PdfString } from './objects';
+import { pdfjsPrep, saslprep } from './saslprep';
 
 const PAD = Buffer.from('28BF4E5E4E758A4164004E56FFFA01082E2E00B6D0683E802F0CA9FE6453697A', 'hex');
 const md5 = (...parts: Uint8Array[]) => {
@@ -97,7 +98,8 @@ function aes256NoIv(key: Uint8Array, data: Uint8Array): Buffer {
 type CryptMethod = 'RC4' | 'AES128' | 'AES256' | 'Identity';
 
 export type OpenResult =
-  | { status: 'ok'; handler: SecurityHandler; password: 'empty' | 'user' | 'owner' }
+  /** `none` opened a file that encrypts only its attached files, whose key the password did not give. */
+  | { status: 'ok'; handler: SecurityHandler; password: 'empty' | 'user' | 'owner' | 'none' }
   | { status: 'password-required' | 'certificate-handler' | 'unknown-handler' | 'unknown-filter'; detail?: string };
 
 /** A stream decryptor that works chunk by chunk. */
@@ -112,7 +114,7 @@ export class SecurityHandler {
   private constructor(
     private readonly version: number,
     readonly keyBits: number,
-    private readonly fileKey: Uint8Array,
+    private readonly fileKey: Uint8Array | undefined,
     readonly streamMethod: CryptMethod,
     readonly stringMethod: CryptMethod,
     readonly embeddedFileMethod: CryptMethod,
@@ -160,26 +162,35 @@ export class SecurityHandler {
     const U = bytesOf(enc.get('U'));
     let keyBits: number;
     let fileKey: Buffer | undefined;
-    let which: 'empty' | 'user' | 'owner' = password === '' ? 'empty' : 'user';
+    let which: 'empty' | 'user' | 'owner' | 'none' = password === '' ? 'empty' : 'user';
 
     if (R === 5 || R === 6) {
       keyBits = 256;
-      const pw = Buffer.from(password, 'utf8').subarray(0, 127);
-      const uKey = () => {
+      const uKey = (pw: Buffer) => {
         if (!hash2B(pw, U.subarray(32, 40), Buffer.alloc(0), R).equals(Buffer.from(U.subarray(0, 32)))) return undefined;
         return aes256NoIv(hash2B(pw, U.subarray(40, 48), Buffer.alloc(0), R), bytesOf(enc.get('UE')));
       };
-      const oKey = () => {
+      const oKey = (pw: Buffer) => {
         const u48 = U.subarray(0, 48);
         if (!hash2B(pw, O.subarray(32, 40), u48, R).equals(Buffer.from(O.subarray(0, 32)))) return undefined;
         return aes256NoIv(hash2B(pw, O.subarray(40, 48), u48, R), bytesOf(enc.get('OE')));
       };
-      fileKey = uKey();
-      if (!fileKey && password !== '') {
-        fileKey = oKey();
-        which = 'owner';
+      // ISO 32000-2 prepares a revision 6 password with SASLprep. pdf.js prepares it its own way and then tries it as
+      // typed, which opens files from writers that skip SASLprep, so every form a reader tries is tried here too.
+      // Revision 5, Adobe's extension, takes it as typed, as pdf.js does.
+      const forms = R === 6 ? [saslprep(password), pdfjsPrep(password), password] : [password];
+      for (const form of new Set(forms)) {
+        if (form === undefined) continue;
+        const pw = Buffer.from(form, 'utf8').subarray(0, 127);
+        fileKey = uKey(pw);
+        if (fileKey) break;
+        // The empty password is tried as the owner password too, as qpdf tries it. pdf.js does not.
+        fileKey = oKey(pw);
+        if (fileKey) {
+          which = 'owner';
+          break;
+        }
       }
-      if (!fileKey) return { status: 'password-required' };
     } else if (R >= 2 && R <= 4) {
       const n = V === 1 ? 5 : V >= 4 ? 16 : (enc.number('Length') ?? 40) / 8;
       if (!Number.isInteger(n) || n < 5 || n > 16) return { status: 'unknown-filter', detail: `key length ${n * 8}` };
@@ -201,7 +212,7 @@ export class SecurityHandler {
       const padded = Buffer.concat([Buffer.from(password, 'latin1').subarray(0, 32), PAD]).subarray(0, 32);
       const asUser = keyFor(padded);
       if (checkUser(asUser)) fileKey = asUser;
-      else if (password !== '') {
+      else {
         // Owner password: derive the RC4 key from it, decrypt O to recover the padded user password.
         let h = md5(padded);
         if (R >= 3) for (let i = 0; i < 50; i++) h = md5(h);
@@ -218,15 +229,35 @@ export class SecurityHandler {
           which = 'owner';
         }
       }
-      if (!fileKey) return { status: 'password-required' };
     } else {
       return { status: 'unknown-filter', detail: `R=${R}` };
+    }
+    if (!fileKey) {
+      // Without a password, pdf.js opens a file whose /AuthEvent /EFOpen filter encrypts only the attached files, and
+      // asks for the password when one is opened. Nothing here can read those files.
+      const plain = (key: string) => enc.get(key) === undefined || enc.name(key) === 'Identity';
+      const efFilter = cf instanceof PdfDict ? cf.get(enc.name('EFF') ?? '') : undefined;
+      const onOpen = efFilter instanceof PdfDict && efFilter.name('AuthEvent') === 'EFOpen';
+      if (password !== '' || V < 4 || !plain('StmF') || !plain('StrF') || !onOpen) return { status: 'password-required' };
+      which = 'none';
     }
     return { status: 'ok', password: which, handler: new SecurityHandler(V, keyBits, fileKey, stm, str, eff, encryptMetadata, cryptFilters, unknownFilters) };
   }
 
+  /** False for a stream whose crypt filter needs the key a file that encrypts only its attached files keeps back. */
+  canDecrypt(stream: PdfStream): boolean {
+    if (this.fileKey) return true;
+    try {
+      return this.methodForStream(stream) === 'Identity';
+    } catch {
+      // An unknown crypt filter fails where the stream is decoded, as it always has.
+      return true;
+    }
+  }
+
   private readonly keyCache = new Map<string, Buffer>();
   private objectKey(num: number, gen: number, method: CryptMethod): Buffer {
+    if (!this.fileKey) throw new Error('No key for an encrypted stream');
     if (method === 'AES256') return Buffer.from(this.fileKey);
     const ck = `${num} ${gen} ${method}`;
     const hit = this.keyCache.get(ck);
@@ -278,10 +309,10 @@ export class SecurityHandler {
     const full = 16 + Math.floor((len - 16) / 16) * 16;
     const tail = await readRaw(full - 32, 32);
     const key = this.objectKey(num, gen, method);
-    const d = crypto.createDecipheriv(key.length === 16 ? 'aes-128-ecb' : 'aes-256-ecb', key, null);
+    // In CBC the block before the last is the last block's IV, so the last block decrypts on its own.
+    const d = crypto.createDecipheriv(key.length === 16 ? 'aes-128-cbc' : 'aes-256-cbc', key, tail.subarray(0, 16));
     d.setAutoPadding(false);
     const last = Buffer.concat([d.update(tail.subarray(16, 32)), d.final()]);
-    for (let i = 0; i < 16; i++) last[i] ^= tail[i];
     const pad = last[15];
     const valid = pad >= 1 && pad <= 16 && last.subarray(16 - pad).every(b => b === pad);
     return full - 16 - (valid ? pad : 0);

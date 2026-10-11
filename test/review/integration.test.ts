@@ -80,7 +80,7 @@ describe('review: integration', function () {
 
   it('does not decode a filter chain longer than 32 stages', async () => {
     const layered = (n: number) => {
-      let data = Buffer.from('hello');
+      let data: Buffer = Buffer.from('hello');
       for (let i = 0; i < n; i++) data = zlib.deflateSync(data);
       return data;
     };

@@ -1,0 +1,15 @@
+%PDF-1.4
+
+1 0 obj
+<< /Kids [<< /Parent 1 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 2 0 R >>] /Count 1 /MediaBox [0 0 612 792] >>
+endobj
+
+2 0 obj
+<< >>
+stream
+BT /F1 24 Tf 72 720 Td (Hello) Tj ET
+endstream
+endobj
+
+trailer
+<< /Root << /Pages 1 0 R >> >>
