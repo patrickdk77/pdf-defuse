@@ -150,9 +150,5 @@ export function encodeTextString(text: string): Uint8Array {
   // PDFDocEncoding maps 0x18-0x1F to accents and leaves 0x7F undefined.
   // biome-ignore lint/suspicious/noControlCharactersInRegex: the range PDFDocEncoding keeps as is starts with control codes.
   if (/^[\x00-\x17\x20-\x7e]*$/.test(text)) return Buffer.from(text, 'latin1');
-  const out = Buffer.alloc(2 + text.length * 2);
-  out[0] = 0xfe;
-  out[1] = 0xff;
-  for (let i = 0; i < text.length; i++) out.writeUInt16BE(text.charCodeAt(i), 2 + i * 2);
-  return out;
+  return Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(text, 'utf16le').swap16()]);
 }
