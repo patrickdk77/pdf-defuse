@@ -76,7 +76,13 @@ export function family(mime: string): string {
  * of "page.html." is html.
  */
 export function extensionOf(name?: string): string | undefined {
-  return /\.([^./\\]+)$/.exec((name ?? '').replace(/[. ]+$/, ''))?.[1].toLowerCase();
+  // A loop and lastIndexOf, since /[. ]+$/ backtracks: a name of 40,000 dots took seconds to match.
+  const n = name ?? '';
+  let end = n.length;
+  while (end > 0 && (n[end - 1] === '.' || n[end - 1] === ' ')) end--;
+  const dot = n.lastIndexOf('.', end - 1);
+  const ext = dot < 0 ? '' : n.slice(dot + 1, end);
+  return ext && !/[/\\]/.test(ext) ? ext.toLowerCase() : undefined;
 }
 
 export function typeFromName(name?: string): string | undefined {

@@ -69,7 +69,7 @@ Removed by default:
 - Actions that reach outside the document: launching programs, links to other or embedded files, form submit and import, show and hide toggles, layer toggles, menu commands and media.
 - Links other than http, https and mailto, and links built to mislead. That covers credentials before the host, IP hosts, punycode or mixed-script hosts, encoded hosts, tooltips or alternate text that name a different site, links and push buttons that cover most of a page, and relative links with no base address.
 - Attached files, portfolios, XFA forms, slideshows, media and 3D annotations, and annotation types outside an allowlist.
-- Encryption with an empty password, or with the password you pass.
+- Encryption with an empty password, or with a password you pass.
 - Earlier revisions, unreferenced objects and damaged structure. The output is one clean revision, unless it is a signed file that keeps its bytes, as described below.
 
 Kept: text, images, fonts, layout, bookmarks, form fields and their values, safe links and metadata.
@@ -121,7 +121,7 @@ A run that stops before it has seen the whole file rejects the file with a null 
 
 | Option | Default | Purpose |
 |---|---|---|
-| `password` | `''` | Tried as the user password, then as the owner password, then as the empty password. See Passwords below |
+| `password` | `''` | One password or a list. pdf-defuse tries each in order, as the user password and then as the owner password, and the empty password last. See Passwords below |
 | `limits` | none | `fileSize`, `objects`, `decompressedBytes`, `nestingDepth` and `timeMs`. A limit left out is not enforced |
 | `stripMetadata` | `false` | Remove the document information dictionary wherever it is referenced, and the XMP metadata of every object: the catalog, pages, images and the rest |
 | `actionOverrides` | none | Change the action for a category, or for a category and detail |
@@ -139,11 +139,13 @@ await disarmPdf(bytes, { actionOverrides: [{ category: 'JAVASCRIPT', action: 're
 
 ### Passwords
 
+`password` takes one password or a list, because one upload can hold files with different passwords, such as a ZIP with one password and a PDF inside it with another. pdf-defuse tries each entry in order, as the user password and then as the owner password, and stops at the first that opens the file. The empty password comes after the list, so a file that opens without a password opens whatever the list holds. ENCRYPTED/USER_PASSWORD or ENCRYPTED/OWNER_PASSWORD says which kind of password opened the file. `pdfPlugin()` gives every attached PDF the list of the run that found it, and `pdfPlugin(options)` gives it the list in `options`.
+
 A revision 6 password, the AES-256 scheme of ISO 32000-2, is tried three ways: prepared with SASLprep, as that standard requires, prepared the way pdf.js prepares it, and as typed. The last opens files from tools that skip SASLprep. Other revisions use the password as typed.
 
 An empty owner password opens a file, as in qpdf, and ENCRYPTED/OWNER_PASSWORD reports it. pdf.js asks for a password there.
 
-A file that encrypts only its attached files, through a crypt filter with `/AuthEvent /EFOpen`, opens without the password, as in pdf.js, and ENCRYPTED/ATTACHMENTS_ONLY reports it. pdf-defuse removes the attached files the password does not decrypt and any other stream under their key, which ENCRYPTED/NO_KEY reports. pdf.js draws such a page blank.
+A file that encrypts only its attached files, through a crypt filter with `/AuthEvent /EFOpen`, opens without a password, as in pdf.js, and ENCRYPTED/ATTACHMENTS_ONLY reports it. pdf-defuse removes the attached files that no password you pass decrypts, and any other stream under their key, which ENCRYPTED/NO_KEY reports. pdf.js draws such a page blank.
 
 ## Plugins
 
@@ -268,7 +270,7 @@ The `fileSize`, `objects` and `decompressedBytes` limits apply to one file and h
 pdf-defuse inspect <file> [options]
 pdf-defuse defuse <in> <out> [options]
 
---password-file <path>   read the password from a file, or set PDF_DEFUSE_PASSWORD
+--password-file <path>   read passwords from a file, one per line; PDF_DEFUSE_PASSWORD holds one
 --plugin <module>        load plugins from a file or an installed package, repeatable
 --config <module>        load a whole options object, repeatable; the other options apply on top
 --keep-type <type>       keep attached files of this MIME type or file extension unchanged, repeatable
@@ -285,6 +287,8 @@ pdf-defuse defuse <in> <out> [options]
 Use `-` for stdin or stdout. The tool copies stdin to a temporary file in `tempDir`, which a `--config` module can set. The copy stops one byte past `limits.fileSize`. The run then rejects the upload without reading the rest, and the finding gives its `size` as the limit plus one. The copy counts toward `limits.timeMs`, and stdin still open at the time limit fails the run with LIMIT/TIME. `inspect` prints its report to stdout. `defuse` does too, unless the PDF itself goes to stdout, and then the report goes to stderr. `defuse` refuses an output that is its input under any name, because a failed write deletes the partial output.
 
 The text report shows each control character as an escape such as `\u001b`. The JSON report escapes DEL and the C1 range too, which JSON itself does not require. A field name or a title from the PDF can hold an escape sequence that rewrites what the terminal shows, the verdict included.
+
+`--password-file` reads one password per line. The tool drops a carriage return at the end of a line and skips blank lines, since the empty password is always tried. Spaces belong to the password. `PDF_DEFUSE_PASSWORD` holds one password, and a line break in it is part of that password. `--password-file` replaces it, and either one replaces a `password` that a `--config` module sets.
 
 `objects`, `nestingDepth` and `timeMs` take whole numbers. `fileSize` and `decompressedBytes` take sizes. Any other value is a usage error.
 

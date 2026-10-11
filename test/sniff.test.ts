@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { sniffType, typeFromName, typesDisagree } from '../src/sniff';
+import { extensionOf, sniffType, typeFromName, typesDisagree } from '../src/sniff';
 
 describe('type sniffing', () => {
   it('recognizes common formats from their first bytes', () => {
@@ -28,5 +28,26 @@ describe('type sniffing', () => {
   it('finds a PDF header anywhere in the first 1024 bytes, as PDF readers do', () => {
     expect(sniffType(Buffer.concat([Buffer.alloc(600, 0x20), Buffer.from('%PDF-1.7\n')]))).to.equal('application/pdf');
     expect(sniffType(Buffer.concat([Buffer.alloc(1100, 0x20), Buffer.from('%PDF-1.7\n')]))).to.equal(undefined);
+  });
+});
+
+describe('extensionOf', () => {
+  it('drops the dots and spaces Windows drops, and reads a long run of them in linear time', () => {
+    const cases: Array<[string | undefined, string | undefined]> = [
+      ['page.html.', 'html'],
+      ['Page.HTML. ', 'html'],
+      ['archive.tar.gz', 'gz'],
+      ['.bashrc', 'bashrc'],
+      ['noext', undefined],
+      ['a.b/c', undefined],
+      ['a.b\\c', undefined],
+      ['...', undefined],
+      ['', undefined],
+      [undefined, undefined],
+    ];
+    for (const [name, ext] of cases) expect([name, extensionOf(name)]).to.deep.equal([name, ext]);
+    const started = Date.now();
+    expect([extensionOf(`${'.'.repeat(200_000)}a`), extensionOf(`${' .'.repeat(100_000)}z`), extensionOf('.'.repeat(200_000))]).to.deep.equal(['a', 'z', undefined]);
+    expect(Date.now() - started).to.be.lessThan(200);
   });
 });

@@ -301,8 +301,11 @@ export interface PdfScoreBands {
 }
 
 export interface PdfOptions {
-  /** Default '', tried as the user password and then as the owner password. */
-  password?: string;
+  /**
+   * Default ''. Each password is tried in order, as the user password and then as the owner password. The empty
+   * password comes after them, so a file that opens without a password opens whatever the list holds.
+   */
+  password?: string | string[];
   /** A limit left out is not enforced. */
   limits?: PdfLimits;
   /** Default false. */

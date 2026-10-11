@@ -2,13 +2,13 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { expect } from 'chai';
-import { type ByteSource, PdfCategory as C, PdfDetail as D, disarmPdf, inspectPdf } from '../src';
+import { type ByteSource, PdfCategory as C, PdfDetail as D, disarmPdf, inspectPdf, pdfPlugin } from '../src';
 import { Rc4 } from '../src/crypto';
 import { PdfDocument } from '../src/document';
 import { bufferSource } from '../src/io';
 import { decodeTextString, type PdfDict, PdfRef, PdfStream, type PdfString } from '../src/objects';
 import { qpdfEncrypt } from './adversarial/helpers';
-import { makeDoc } from './helpers/builder';
+import { attach, makeDoc } from './helpers/builder';
 import { fixtures, has, must, scan } from './helpers/util';
 
 const read = (n: string) => fs.readFileSync(path.join(fixtures, n));
@@ -69,6 +69,92 @@ describe('crypto', () => {
       expect(out.strings).to.include('Encrypted fixture');
     });
   }
+
+  describe('password lists', () => {
+    const userpw = ['r2-rc4-40-userpw.pdf', 'r3-rc4-128-userpw.pdf', 'r4-aes128-userpw.pdf', 'r6-aes256-userpw.pdf', 'r4-aes128-objstm-userpw.pdf', 'r6-aes256-objstm-userpw.pdf'];
+    /** The findings that say how the file opened, without the ones that name the algorithm. */
+    const opened = async (pdf: Buffer, password?: string | string[]) =>
+      (await inspectPdf(pdf, { password })).findings.filter(f => f.category === C.Encrypted && f.action !== 'info').map(f => f.detail);
+
+    it('tries the passwords in order, each as the user password and then as the owner password', async () => {
+      for (const name of userpw) {
+        expect(await opened(read(name), ['user', 'owner']), name).to.deep.equal([D.UserPassword]);
+        expect(await opened(read(name), ['owner', 'user']), name).to.deep.equal([D.OwnerPassword]);
+      }
+    });
+
+    it('opens a file with a later password when the earlier ones do not open it', async () => {
+      for (const name of userpw) {
+        for (const [password, detail] of [
+          [['nope', '', 'wrong', 'user'], D.UserPassword],
+          [['nope', 'owner'], D.OwnerPassword],
+        ] as const) {
+          const r = await disarmPdf(read(name), { password: [...password] });
+          expect({ status: r.status, opened: has(r.before, C.Encrypted, detail) }, `${name} ${detail}`).to.deep.equal({ status: 'defused', opened: true });
+          const out = await scan(must(r.bytes, 'output bytes'));
+          expect(out.keys.has('Encrypt')).to.equal(false);
+          expect(out.strings).to.include('Encrypted fixture');
+        }
+      }
+    });
+
+    it('opens a file that needs no password whatever the list holds, and rejects one no entry opens', async () => {
+      for (const name of ['r2-rc4-40.pdf', 'r4-aes128.pdf', 'r6-aes256.pdf']) {
+        expect(await opened(read(name), ['nope', 'wrong']), name).to.deep.equal([D.EmptyPassword]);
+        expect(await opened(read(name), []), name).to.deep.equal([D.EmptyPassword]);
+        expect((await disarmPdf(read(name), { password: ['nope', 'wrong'] })).status, name).to.equal('defused');
+      }
+      for (const name of userpw) {
+        const r = await inspectPdf(read(name), { password: ['nope', 'wrong'] });
+        expect({ status: r.status, score: r.score, required: has(r, C.Encrypted, D.PasswordRequired) }, name).to.deep.equal({ status: 'rejected', score: null, required: true });
+      }
+      // A file that encrypts only its attached files opens without a password, and a later entry still gives the key.
+      const attachmentsOnly = read(path.join('cases', 'attachments-only-content-typed.pdf'));
+      expect(await opened(attachmentsOnly, ['nope'])).to.deep.equal([D.AttachmentsOnly, D.NoKey]);
+      expect(await opened(attachmentsOnly, ['nope', 'attachment'])).to.deep.equal([D.UserPassword]);
+    });
+
+    it('takes a single string as it always has, the same as a list of that one password', async () => {
+      const expected: Record<string, D[]> = { '': [D.PasswordRequired], user: [D.UserPassword], owner: [D.OwnerPassword], nope: [D.PasswordRequired] };
+      for (const name of userpw) {
+        for (const [password, detail] of Object.entries(expected)) {
+          expect(await opened(read(name), password), `${name} ${password}`).to.deep.equal(detail);
+          const one = await disarmPdf(read(name), { password });
+          const list = await disarmPdf(read(name), { password: [password] });
+          expect({ status: list.status, findings: list.before.findings, bytes: list.bytes && Buffer.from(list.bytes).toString('hex') }, `${name} ${password}`).to.deep.equal({
+            status: one.status,
+            findings: one.before.findings,
+            bytes: one.bytes && Buffer.from(one.bytes).toString('hex'),
+          });
+        }
+      }
+      expect(await opened(read('r4-aes128.pdf'), 'nope')).to.deep.equal([D.EmptyPassword]);
+    });
+
+    it('hands the list to an attached PDF, and pdfPlugin(options) hands on its own', async () => {
+      // The upload opens with its own password and the PDF attached inside it with another.
+      const inner = read('r4-aes128-userpw.pdf');
+      const upload = qpdfEncrypt(attach('inner.pdf', 'application/pdf', inner), ['--encrypt', 'outer', 'outer-owner', '256', '--']);
+      const seen = async (password: string | string[], plugin: ReturnType<typeof pdfPlugin>) => {
+        const r = await disarmPdf(upload, { password, filePlugins: [plugin] });
+        // How each file opened, and what became of the attached PDF.
+        const shown = r.before.findings.filter(f => (f.category === C.Encrypted && f.action !== 'info') || (f.category === C.EmbeddedFile && f.attachment === undefined));
+        return { status: r.status, findings: shown.map(f => `${f.attachment ?? 'upload'} ${f.category}/${f.detail}`) };
+      };
+      expect(await seen(['outer', 'user'], pdfPlugin())).to.deep.equal({
+        status: 'defused',
+        findings: ['upload ENCRYPTED/USER_PASSWORD', 'upload EMBEDDED_FILE/PLUGIN_SCRUBBED', 'inner.pdf ENCRYPTED/USER_PASSWORD'],
+      });
+      expect(await seen('outer', pdfPlugin({ password: ['nope', 'user'] }))).to.deep.equal({
+        status: 'defused',
+        findings: ['upload ENCRYPTED/USER_PASSWORD', 'upload EMBEDDED_FILE/PLUGIN_SCRUBBED', 'inner.pdf ENCRYPTED/USER_PASSWORD'],
+      });
+      expect(await seen('outer', pdfPlugin())).to.deep.equal({
+        status: 'defused',
+        findings: ['upload ENCRYPTED/USER_PASSWORD', 'upload EMBEDDED_FILE/PLUGIN_REMOVED', 'inner.pdf ENCRYPTED/PASSWORD_REQUIRED'],
+      });
+    });
+  });
 
   it('decrypts streams in chunks to exactly the plaintext length', async () => {
     for (const name of ['r4-aes128.pdf', 'r6-aes256.pdf', 'r3-rc4-128.pdf']) {

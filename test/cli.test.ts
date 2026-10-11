@@ -142,6 +142,34 @@ describe('command-line tool', () => {
     expect(flag.stderr.toString()).to.include('not on the command line');
   });
 
+  it('reads one password per line from the password file, and one password from the environment', () => {
+    const opened = (pdf: string, args: string[], env: NodeJS.ProcessEnv = {}) => {
+      const r = runCli(['inspect', path.join(fixtures, pdf), ...args, '--json'], { env });
+      const findings = (JSON.parse(r.stdout.toString()) as InspectJson).findings;
+      return { status: r.status, opened: findings.filter(f => f.category === 'ENCRYPTED' && f.action !== 'info').map(f => f.detail) };
+    };
+    const file = (name: string, text: string) => {
+      fs.writeFileSync(path.join(dir, name), text);
+      return ['--password-file', path.join(dir, name)];
+    };
+    const enc = 'r4-aes128-userpw.pdf';
+    // CRLF and LF lines, blank lines, and a last line without a newline.
+    expect(opened(enc, file('several.txt', 'nope\r\n\r\nwrong\n\nuser'))).to.deep.equal({ status: 1, opened: ['USER_PASSWORD'] });
+    expect(opened(enc, file('owner.txt', 'nope\nowner\n'))).to.deep.equal({ status: 1, opened: ['OWNER_PASSWORD'] });
+    expect(opened(enc, file('crlf.txt', 'user\r\n'))).to.deep.equal({ status: 1, opened: ['USER_PASSWORD'] });
+    // Spaces are part of a password, so this line is not blank and does not open the file.
+    expect(opened(enc, file('spaces.txt', ' user \n'))).to.deep.equal({ status: 2, opened: ['PASSWORD_REQUIRED'] });
+    // A file of blank lines leaves only the empty password.
+    expect(opened(enc, file('blank.txt', '\n\r\n\n'))).to.deep.equal({ status: 2, opened: ['PASSWORD_REQUIRED'] });
+    expect(opened('r4-aes128.pdf', ['--password-file', path.join(dir, 'blank.txt')])).to.deep.equal({ status: 1, opened: ['EMPTY_PASSWORD'] });
+    expect(opened('r4-aes128.pdf', ['--password-file', path.join(dir, 'several.txt')])).to.deep.equal({ status: 1, opened: ['EMPTY_PASSWORD'] });
+    // The environment holds one password, so a line break in it is part of that password.
+    expect(opened(enc, [], { PDF_DEFUSE_PASSWORD: 'owner' })).to.deep.equal({ status: 1, opened: ['OWNER_PASSWORD'] });
+    expect(opened(enc, [], { PDF_DEFUSE_PASSWORD: 'nope\nuser' })).to.deep.equal({ status: 2, opened: ['PASSWORD_REQUIRED'] });
+    // The password file replaces the environment's password.
+    expect(opened(enc, file('wrong.txt', 'nope\n'), { PDF_DEFUSE_PASSWORD: 'user' })).to.deep.equal({ status: 2, opened: ['PASSWORD_REQUIRED'] });
+  });
+
   it('exits 3 on usage errors', () => {
     expect(runCli([]).status).to.equal(3);
     expect(runCli(['inspect']).status).to.equal(3);

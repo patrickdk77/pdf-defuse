@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2 - 2026-10-11
+
+- `password` takes a list as well as one password, since files in one upload can have different passwords. pdf-defuse tries each entry in order, as the user password and then as the owner password, and the empty password after them. An attached PDF that `pdfPlugin` opens gets the run's list, or the one in `pdfPlugin(options)`. A single string works as before.
+- A file name's extension is read in linear time. The old pattern took seconds on an attachment name of tens of thousands of dots.
+- `--password-file` holds one password per line. The tool drops a carriage return at the end of a line and skips blank lines. A password with a line break in it goes in `PDF_DEFUSE_PASSWORD`, which still holds one password.
+
+## 0.2.1 - 2026-10-11
+
+- Text strings that need UTF-16 are written with Node's own encoder. The output bytes are the same as in 0.2.0.
+
 ## 0.2.0 - 2026-10-11
 
 ### Damaged files

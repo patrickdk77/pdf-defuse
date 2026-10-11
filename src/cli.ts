@@ -16,7 +16,7 @@ const USAGE = `Usage:
   pdf-defuse defuse <in> <out> [options]
 
 Options:
-  --password-file <path>   read the password from a file, or set PDF_DEFUSE_PASSWORD
+  --password-file <path>   read passwords from a file, one per line; PDF_DEFUSE_PASSWORD holds one
   --plugin <module>        load plugins from a file or an installed package, repeatable
   --config <module>        load a whole options object, repeatable; the other options apply on top
   --keep-type <type>       keep contained files of this MIME type or file extension unchanged, repeatable
@@ -133,7 +133,7 @@ async function parse(argv: string[]): Promise<Parsed> {
   let stripMetadata = false;
   let json = false;
   const delimited: DelimitedOptions = {};
-  let password: string | undefined = process.env.PDF_DEFUSE_PASSWORD;
+  let password: string | string[] | undefined = process.env.PDF_DEFUSE_PASSWORD;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     const next = () => {
@@ -143,7 +143,11 @@ async function parse(argv: string[]): Promise<Parsed> {
     };
     switch (a) {
       case '--password-file':
-        password = (await fsp.readFile(next(), 'utf8')).replace(/\r?\n$/, '');
+        // The empty password is always tried, so a blank line adds nothing.
+        password = (await fsp.readFile(next(), 'utf8'))
+          .split('\n')
+          .map(line => line.replace(/\r$/, ''))
+          .filter(line => line !== '');
         break;
       case '--plugin':
         ordered.push(...pluginsFrom(await loadModule(next())));

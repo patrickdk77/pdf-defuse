@@ -231,7 +231,7 @@ interface DocumentIssues {
 }
 
 interface OpenOptions {
-  password?: string;
+  password?: string | readonly string[];
   decompressedBytes?: number;
   objectLimit?: number;
   deadline?: number;
@@ -665,10 +665,15 @@ export class PdfDocument {
     for (const num of read.keys()) this.encryptRefs.add(num);
     const id = this.trailer.get('ID');
     const id0 = Array.isArray(id) && id[0] instanceof PdfString ? id[0].bytes : new Uint8Array(0);
-    const password = this.opts.password ?? '';
-    let r = SecurityHandler.open(dict, id0, password);
-    // A password meant for other files must not lock out one that opens without a password.
-    if (r.status === 'password-required' && password !== '') r = SecurityHandler.open(dict, id0, '');
+    const given = this.opts.password ?? '';
+    // A password meant for other files must not lock out one that opens without a password, so the empty one comes last.
+    const passwords = new Set([...(typeof given === 'string' ? [given] : given), '']);
+    let r: OpenResult = { status: 'password-required' };
+    for (const password of passwords) {
+      this.checkTime();
+      r = SecurityHandler.open(dict, id0, password);
+      if (r.status !== 'password-required') break;
+    }
     this.securityResult = r;
     if (r.status === 'ok') this.security = r.handler;
     // Objects and object streams read before the key existed hold ciphertext.
