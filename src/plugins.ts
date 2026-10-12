@@ -1,3 +1,4 @@
+import { detectPdfSource } from './detect';
 import { disarmAtDepth } from './engine';
 import { weightOf } from './score';
 import { extensionOf, typeFromName } from './sniff';
@@ -34,8 +35,9 @@ export function pdfPlugin(options?: PdfOptions): ContainedFilePlugin {
   return {
     kind: 'file',
     name: 'pdf',
-    // It can only read PDF bytes, so the content decides, whatever the name says.
-    accepts: f => f.sniffedType === 'application/pdf',
+    // It takes what detectPdf finds to be a PDF: a header in the first 1024 bytes, or no header, a name or declared
+    // type that says PDF, and content that opens as one.
+    accepts: async f => f.sniffedType === 'application/pdf' || (await detectPdfSource(f.source, { name: f.name, declaredType: f.declaredType })) !== undefined,
     async process(file, sink, context) {
       const run = options ?? (context as RunContext)[RUN_OPTIONS] ?? {};
       const r = await disarmAtDepth(file.source, sink, run, context.depth, context.deadline);

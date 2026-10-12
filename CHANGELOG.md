@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 - 2026-10-11
+
+- `detectPdf` and `detectPdfSource` tell a router whether pdf-defuse reads a file. A header in the first 1024 bytes decides. Without one, a file whose name or declared type says PDF counts when it opens as one, as pdf.js reads it.
+- `pdfPlugin` takes what `detectPdf` finds, so an attached PDF without a header now reaches pdf-defuse when its name or declared type says PDF.
+
 ## 0.2.2 - 2026-10-11
 
 - `password` takes a list as well as one password, since files in one upload can have different passwords. pdf-defuse tries each entry in order, as the user password and then as the owner password, and the empty password after them. An attached PDF that `pdfPlugin` opens gets the run's list, or the one in `pdfPlugin(options)`. A single string works as before.
