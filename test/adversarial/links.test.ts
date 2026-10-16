@@ -75,6 +75,10 @@ describe('adversarial: link checks', () => {
       const r = await link(uri, '', { catalog });
       expect(r.uriSurvives, `${uri} ${JSON.stringify(r)}`).to.equal(false);
     }
+    // A name reads as /javascript:... and as javascript:...; the relative first reading does not end the check.
+    const named = await run(makeDoc({ annots: [LINK('<< /S /URI /URI /javascript:app.alert#281#29 >>')] }).pdf);
+    expect(has(named.r.before, C.JavaScript, D.Url)).to.equal(true);
+    expect(must(named.out, 'output scan').keys.has('URI')).to.equal(false);
     // An escaped key still reads as /URI.
     const { r, out } = await run(makeDoc({ annots: [LINK('<< /S /U#52I /U#52I (javascript:x) >>')] }).pdf);
     expect(has(r.before, C.JavaScript, D.Url)).to.equal(true);

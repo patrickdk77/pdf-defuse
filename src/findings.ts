@@ -53,6 +53,7 @@ def(C.JavaScript, D.Chained, 'strip', 50, 'JavaScript runs after another action'
 def(C.JavaScript, D.Rendition, 'strip', 50, 'A media action carries JavaScript');
 def(C.JavaScript, D.Url, 'strip', 50, 'A link uses a javascript: URL');
 def(C.JavaScript, D.Unattached, 'strip', 50, 'A JavaScript entry sits outside any action');
+def(C.JavaScript, D.Xfa, 'strip', 50, 'An XFA form script, in <language>, runs on a form event');
 def(C.JavaScript, D.PluginPassed, 'info', 40, 'JavaScript kept unchanged by plugin <plugin>');
 def(C.JavaScript, D.PluginScrubbed, 'info', 20, 'JavaScript rewritten and kept by plugin <plugin>');
 def(C.JavaScript, D.PluginFailed, 'strip', 0, 'Plugin <plugin> failed, so the JavaScript was removed');
@@ -80,7 +81,8 @@ def(C.Link, D.LookalikeHost, 'strip', 40, "A link's host uses punycode or mixed 
 def(C.Link, D.EncodedHost, 'strip', 40, "A link's host is percent-encoded");
 def(C.Link, D.TextMismatch, 'strip', 40, "A link's tooltip names a different site");
 def(C.Link, D.FullPage, 'strip', 20, 'A link covers most of the page');
-def(C.Link, D.Relative, 'strip', 30, "A relative link with no base address, which resolves against the file's own location");
+def(C.Link, D.Relative, 'info', 0, "A relative link, which resolves against the file's own location");
+def(C.Link, D.PathTrick, 'strip', 40, 'A relative link whose path is written to read as another path<: {reason}|>');
 // EMBEDDED_FILE
 def(C.EmbeddedFile, D.NoPlugin, 'strip', 30, '<Attached file "{name}"|An attached file> (<{sniffed}|{type}|unknown type>) removed. No plugin accepts this type');
 def(
@@ -107,7 +109,18 @@ def(C.Media, D.Slideshow, 'strip', 30, 'Embedded slideshow removed');
 def(C.Annotation, D.UnknownSubtype, 'strip', 30, 'An annotation of a type outside the allowlist');
 // FORM
 def(C.Form, D.Fields, 'info', 0, 'PDF has fillable form fields');
-def(C.Form, D.Xfa, 'strip', 40, 'PDF has an XFA form, which carries its own scripts');
+def(C.Form, D.Xfa, 'info', 10, 'PDF has an XFA form. Its scripts, links and connections are checked like the rest of the file');
+def(C.Form, D.XfaUnreadable, 'strip', 40, 'An XFA form that could not be read exactly was removed whole: <reason>');
+def(C.Form, D.XfaPacket, 'strip', 30, 'An XFA <packet> packet removed');
+def(C.Form, D.XfaExecute, 'strip', 50, 'An XFA form calls a web service or database');
+def(C.Form, D.XfaConnection, 'strip', 40, 'An XFA form connects to a web service or data source');
+def(C.Form, D.XfaExternalObject, 'strip', 60, 'An XFA form embeds an external object');
+def(C.Form, D.XfaExternalReference, 'strip', 40, 'An XFA form names something outside the PDF to load');
+def(C.Form, D.XfaImage, 'strip', 20, 'An XFA form image (<type|unknown type>) removed. <reason|No plugin accepts this type>');
+def(C.Form, D.PluginPassed, 'info', 10, 'XFA form image kept by plugin <plugin> with nothing removed');
+def(C.Form, D.PluginScrubbed, 'info', 5, 'XFA form image cleaned and kept by plugin <plugin>');
+def(C.Form, D.PluginFailed, 'strip', 0, 'Plugin <plugin> failed, so the XFA form image was removed');
+def(C.Form, D.PluginRemoved, 'strip', 0, 'XFA form image removed by plugin <plugin>');
 def(C.Form, D.CalculationOrder, 'strip', 20, 'Form calculation order removed with the calculation scripts it ran');
 // SIGNATURE
 def(C.Signature, D.Signed, 'info', 0, 'PDF is digitally signed. A rewrite invalidates the signature');

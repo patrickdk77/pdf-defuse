@@ -948,13 +948,13 @@
       }
     },
     "xfa-event-script.pdf": {
-      "issue": "An XFA form whose field runs a script on its initialize event. pdf.js does not show XFA scripts. pdf-defuse removes the XFA.",
+      "issue": "An XFA form whose field runs a script on its initialize event. pdf.js does not show XFA scripts. pdf-defuse keeps the form and removes the script, since no plugin keeps it.",
       "expected": {
         "status": "strippable",
-        "risk": "MEDIUM",
+        "risk": "HIGH",
         "pages": 1,
-        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT", "FORM/XFA"],
-        "info": ["FORM/FIELDS"],
+        "kinds": ["CORRUPTED/LEADING_BYTES", "CORRUPTED/MALFORMED_OBJECT", "CORRUPTED/STREAM_LENGTH_WRONG", "CORRUPTED/XREF_REBUILT", "JAVASCRIPT/XFA"],
+        "info": ["FORM/FIELDS", "FORM/XFA"],
         "disarm": "defused"
       },
       "before": {

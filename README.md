@@ -67,12 +67,24 @@ Removed by default:
 
 - JavaScript wherever it lives: document scripts, open actions, page, annotation and field triggers, links, bookmarks, chained actions and media actions.
 - Actions that reach outside the document: launching programs, links to other or embedded files, form submit and import, show and hide toggles, layer toggles, menu commands and media.
-- Links other than http, https and mailto, and links built to mislead. That covers credentials before the host, IP hosts, punycode or mixed-script hosts, encoded hosts, tooltips or alternate text that name a different site, links and push buttons that cover most of a page, and relative links with no base address.
-- Attached files, portfolios, XFA forms, slideshows, media and 3D annotations, and annotation types outside an allowlist.
+- Links other than http, https and mailto, and links built to mislead. That covers credentials before the host, IP hosts, punycode or mixed-script hosts, encoded hosts, tooltips or alternate text that name a different site, links and push buttons that cover most of a page, and relative links whose path is written to read as another path.
+- Attached files, portfolios, slideshows, media and 3D annotations, and annotation types outside an allowlist.
+- From XFA forms, the scripts no plugin keeps, submits, web service calls, data connections, external objects and anything that names a file or address outside the PDF. The form itself stays, as XFA forms below describes.
 - Encryption with an empty password, or with a password you pass.
 - Earlier revisions, unreferenced objects and damaged structure. The output is one clean revision, unless it is a signed file that keeps its bytes, as described below.
 
-Kept: text, images, fonts, layout, bookmarks, form fields and their values, safe links and metadata.
+Kept: text, images, fonts, layout, bookmarks, form fields and their values, XFA forms and their data, safe links, relative links and metadata.
+
+A relative link is an ordinary way to point at a file beside the PDF, so it stays and LINK/RELATIVE reports it as `info`. Climbing with `..` from the start, as `../manual/page.html` does, is ordinary too. LINK/PATH_TRICK removes a relative link whose path is written to read as another path, and its `reason` says which of these it found:
+
+- a control character, which readers drop before they read the address;
+- a backslash, which browsers read as a slash;
+- an encoded dot, slash, backslash or NUL;
+- a segment of only dots and spaces, which Windows reads as `..` or as nothing;
+- a path that names a folder and then climbs above where it started;
+- a colon in the first segment, which reads as a scheme once the address is decoded, as `%6Aavascript:` does.
+
+The catalog's `/URI /Base` stays in the output, so a relative link resolved against a hostile base gets the base's verdict. A link given as a name has two readings, `/x` and `x`, and both must pass. Override LINK/RELATIVE to `strip` to remove relative links as well.
 
 Every file that is not rejected is rewritten, so the output holds only what pdf-defuse read. That includes a file with nothing to remove, whose status stays `clean`.
 
@@ -86,6 +98,23 @@ A rewrite invalidates a signature, so a signed file can keep its bytes instead. 
 
 Before anything reaches your sink, pdf-defuse inspects its own output. It rejects the file if anything removable is left, if the page count changed, or if any page's content changed length.
 
+## XFA forms
+
+An XFA form keeps its layout, its fields, its data and the scripts a plugin keeps. pdf-defuse reads the form's XML from the `/XFA` stream or packet array and removes everything else that can act:
+
+- Every `<script>` in the template and form packets goes to the script plugins with `form: 'xfa'` and a `language` of `javascript` or `formcalc`. XFA reads a script with no content type as FormCalc, and so does pdf-defuse. The trigger is `xfa-` and the event, such as `xfa-click`, `xfa-calculate` or `xfa-script-object`, and `fieldName` holds the SOM path of the node the script belongs to. JAVASCRIPT/XFA reports each script. pdf-defuse empties a script no plugin keeps and leaves its element in place. A script in another language, or one with markup inside it, goes whatever the overrides say.
+- `<submit>` goes as ACTION/SUBMIT_FORM, `<execute>` as FORM/XFA_EXECUTE and `<exObject>` as FORM/XFA_EXTERNAL_OBJECT. `<connect>` goes as FORM/XFA_CONNECTION, and so does every connection in the connectionSet but the schema's `xsdConnection`.
+- FORM/XFA_EXTERNAL_REFERENCE removes what points outside the PDF. That is an `href` holding an address or an absolute path, a `usehref` to another file, the `url` and `server` attributes of the template, the schema connection's `<uri>`, and the config's `uri`, `submitUrl`, `xsl`, `outputXSL` and `base`. In government forms these are mostly paths on the designer's own machine. A relative image name such as `.\logo.png` or `..\images\seal.png` stays unless it is written to read as another path, by the rules LINK/PATH_TRICK uses, and such a name goes as FORM/XFA_EXTERNAL_REFERENCE. XFA names are Windows paths, so a backslash there separates folders.
+- A rich text link, `<a href>`, gets the checks a link action gets and the same LINK findings, so a relative one stays. An unsafe link loses its `href` and keeps its text.
+- An inline image goes to the file plugins the way an attached file does, whether it sits in the template, the form packet or a data value with an image type. Viewers decode these images with decoders of their own, and CVE-2010-0188 reached one with a crafted TIFF. FORM/XFA_IMAGE removes an image no plugin takes. FORM/PLUGIN_PASSED, PLUGIN_SCRUBBED, PLUGIN_REMOVED and PLUGIN_FAILED report what a plugin did with one.
+- pdf-defuse keeps the template, datasets, config, localeSet, connectionSet, form and xmpmeta packets, and drops xmpmeta under `stripMetadata`. Every other packet goes as FORM/XFA_PACKET, stylesheet, pdf, xfdf, sourceSet and signature among them. A packet stream left empty leaves the packet array, name and all.
+
+pdf-defuse writes each changed packet stream back compressed and keeps the catalog's `/NeedsRendering`, so a dynamic form still draws from its XFA. A changed template no longer matches the form packet's checksum, so a viewer merges the template and the data again. The values a user entered live in the data and stay.
+
+The reader is strict. The XML must be UTF-8 and well formed, under one `xdp` root element. A DOCTYPE, an entity other than the five XML defines, or anything else it cannot read exactly as a viewer would removes the whole form as FORM/XFA_UNREADABLE, whatever the overrides say. A packet array that holds anything but streams goes the same way. The reader takes the whole form into memory, so `memoryThreshold` does not apply to it. `limits.decompressedBytes` caps each packet.
+
+FORM/XFA is `info` and only reports the form. Override it to `strip` to remove every XFA form whole, as 0.2.3 did. `/NeedsRendering` goes with it.
+
 ## Findings
 
 Every finding has two enums and a string. `category` is the kind, such as `ENCRYPTED` or `JAVASCRIPT`. `detail` is the exact variant, such as `EMPTY_PASSWORD` or `OPEN_ACTION`. `description` is a plain sentence that is safe to show the uploader. A description can name the attached file it is about. pdf-defuse cuts that name to 60 characters and replaces control and direction characters with `?`, and `data` keeps the name whole.
@@ -95,7 +124,7 @@ Every finding has two enums and a string. `category` is the kind, such as `ENCRY
 { category: 'ENCRYPTED', detail: 'RC4_40', description: 'Encryption is RC4 with a 40-bit key', action: 'info' }
 ```
 
-`action` says what happens: `reject` refuses the file, `strip` removes the content and `info` only reports it. An override to `strip` removes the content for METADATA/XMP, METADATA/INFO_DICTIONARY, LINK/SAFE and EMBEDDED_FILE/TYPE_MISMATCH. Some `info` findings name content that every rewrite drops anyway, such as SIGNATURE/USAGE_RIGHTS, STRUCTURE/ESCAPED_NAMES and the ENCRYPTED findings that name the algorithm. A `strip` override on one of those changes only the status. The other `info` findings, such as FORM/FIELDS, SIGNATURE/SIGNED, STRUCTURE/VERSION_UPGRADED and the PLUGIN_PASSED and PLUGIN_SCRUBBED findings, name nothing that can be removed. A `strip` override on one of them leaves the finding in the output, so the output fails its own inspection and the upload is rejected.
+`action` says what happens: `reject` refuses the file, `strip` removes the content and `info` only reports it. An override to `strip` removes the content for METADATA/XMP, METADATA/INFO_DICTIONARY, LINK/SAFE, LINK/RELATIVE and EMBEDDED_FILE/TYPE_MISMATCH. Some `info` findings name content that every rewrite drops anyway, such as SIGNATURE/USAGE_RIGHTS, STRUCTURE/ESCAPED_NAMES and the ENCRYPTED findings that name the algorithm. A `strip` override on one of those changes only the status. The other `info` findings, such as FORM/FIELDS, SIGNATURE/SIGNED, STRUCTURE/VERSION_UPGRADED and the PLUGIN_PASSED and PLUGIN_SCRUBBED findings, name nothing that can be removed. A `strip` override on one of them leaves the finding in the output, so the output fails its own inspection and the upload is rejected.
 
 Some content goes whatever an override says. Its finding then shows `strip`, or `reject` if you override it to that. This covers a script reference an action loses under the re-checking rules described under Plugins, a reference to an object stream or cross-reference stream, and an attached file a plugin removed or failed on, or that the password does not decrypt. It also covers any other stream encrypted with a key the password does not give, which ENCRYPTED/NO_KEY reports. It also covers a reference in `/Annots` to an object that already has another role, and a reference to a file specification that is the catalog, a page, or the names or information dictionary and carries an embedded file. Such an object keeps its role and its own entries, `/EF` included, so that embedded file stays in the output. Only the reference that treated the object as a file specification goes.
 
@@ -128,7 +157,7 @@ A run that stops before it has seen the whole file rejects the file with a null 
 | `scoreWeights`, `scoreBands` | built in | Change the scoring |
 | `filePlugins`, `scriptPlugins` | none | Keep chosen attached files or scripts |
 | `tempDir` | `os.tmpdir()` | Where temporary files go |
-| `memoryThreshold` | 8 MiB | `disarmPdfSource` keeps its copy of the upload in memory up to this size and in a temporary file above it. Each decoded attachment above this size goes through a temporary file. Decoded object streams share this much memory, and the ones that do not fit go to temporary files, so each is decoded once. A decoded attachment's file is deleted once its plugins have decided it. Scrubbed attachment copies waiting for the write, and an attachment decoded again so a plugin can check its further names, share this much memory between them. One that does not fit goes to a temporary file. A script that decodes larger than this is removed without going to the script plugins |
+| `memoryThreshold` | 8 MiB | `disarmPdfSource` keeps its copy of the upload in memory up to this size and in a temporary file above it. Each decoded attachment above this size goes through a temporary file. Decoded object streams share this much memory, and the ones that do not fit go to temporary files, so each is decoded once. A decoded attachment's file is deleted once its plugins have decided it. Scrubbed attachment copies waiting for the write, and an attachment decoded again so a plugin can check its further names, share this much memory between them. One that does not fit goes to a temporary file. A script that decodes larger than this is removed without going to the script plugins. An XFA form goes into memory whole |
 | `preserveSignatures` | `true` | Keep the bytes of a clean file that is signed over all of it, as described under What it removes and what it keeps. `false` rewrites it like any other file, which invalidates the signature |
 
 To reject every file that contains JavaScript instead of removing the scripts:
@@ -210,7 +239,7 @@ const svgPlugin = {
 
 The third argument to `process` holds `depth`, the depth of the file itself, and `deadline` when `limits.timeMs` is set. `deadline` is the `Date.now()` value the whole run must finish by. `pdfPlugin` hands it to the attached PDF's run, so an upload and everything attached to it share one time limit. A plugin that keeps working past it delays the result, because the run is rejected for time only once the plugin returns.
 
-A script plugin receives each script with its trigger, location and field name. The text has its NUL characters removed, as pdf.js removes them before it runs a script. Document-level scripts arrive first, and each later script sees which of them were kept. Several actions can share one script object. Once a plugin keeps it, the plugins see it again for each other action that runs it, with that action's trigger. That includes an action reached through a key the action rules do not cover, such as the `/A` of a bookmark pdf-defuse does not recognize, which arrives with the trigger `unknown`. The script keeps its first answer. An action that gets a different answer, or a different rewrite, loses its reference to the script. Past a set amount of this re-checking, later actions lose the script without the plugins being asked. Every action that loses the script gets a `strip` finding at its own location. A chain of actions with no script in it is never checked again.
+A script plugin receives each script with its trigger, location, field name, `language` and `form`. `form` is `acroform` for the PDF's own scripts and `xfa` for an XFA form's, and only an XFA script can have the `language` `formcalc`. The text has its NUL characters removed, as pdf.js removes them before it runs a script. Document-level scripts arrive first, and each later script sees which of them were kept. Several actions can share one script object. Once a plugin keeps it, the plugins see it again for each other action that runs it, with that action's trigger. That includes an action reached through a key the action rules do not cover, such as the `/A` of a bookmark pdf-defuse does not recognize, which arrives with the trigger `unknown`. The script keeps its first answer. An action that gets a different answer, or a different rewrite, loses its reference to the script. Past a set amount of this re-checking, later actions lose the script without the plugins being asked. Every action that loses the script gets a `strip` finding at its own location. A chain of actions with no script in it is never checked again.
 
 ```js
 const scriptPlugin = {
@@ -220,6 +249,8 @@ const scriptPlugin = {
   process: async (script) => ({ result: 'passed' }),
 };
 ```
+
+A script plugin can also return `findings` with its result, saying what it found in the script. They go into the report at the script's location, unless a finding gives a finer one, such as the line. A `reject` among them is recorded as `strip`, since the plugin decides one script, not the file. [script-defuse](https://github.com/patrickdk77/script-defuse)'s `formScriptPlugin` keeps form calculations, formats and checks, and reports why it removed every other script.
 
 ## The defuse family
 

@@ -84,6 +84,7 @@ export enum PdfDetail {
   TextMismatch = 'TEXT_MISMATCH',
   FullPage = 'FULL_PAGE',
   Relative = 'RELATIVE',
+  PathTrick = 'PATH_TRICK',
   // EMBEDDED_FILE
   NoPlugin = 'NO_PLUGIN',
   TypeMismatch = 'TYPE_MISMATCH',
@@ -101,6 +102,13 @@ export enum PdfDetail {
   Fields = 'FIELDS',
   Xfa = 'XFA',
   CalculationOrder = 'CALCULATION_ORDER',
+  XfaUnreadable = 'XFA_UNREADABLE',
+  XfaPacket = 'XFA_PACKET',
+  XfaExecute = 'XFA_EXECUTE',
+  XfaConnection = 'XFA_CONNECTION',
+  XfaExternalObject = 'XFA_EXTERNAL_OBJECT',
+  XfaExternalReference = 'XFA_EXTERNAL_REFERENCE',
+  XfaImage = 'XFA_IMAGE',
   // SIGNATURE
   Signed = 'SIGNED',
   Certified = 'CERTIFIED',
@@ -265,19 +273,25 @@ export interface ContainedFilePlugin {
 
 export interface ContainedScript {
   text: string;
-  /** "document", "open", "page-open", "field-format", "link", "bookmark", ... */
+  /** "document", "open", "page-open", "field-format", "link", "bookmark", ... For an XFA script, "xfa-" and its event: "xfa-click", "xfa-calculate", "xfa-script-object". */
   trigger: string;
   location: string;
+  /** For an XFA script, the SOM path of the node that holds it. */
   fieldName?: string;
   /** Names of document-level scripts a plugin kept. */
   keptDocumentScripts: string[];
+  /** 'formcalc' only for an XFA script written in FormCalc. */
+  language: 'javascript' | 'formcalc';
+  /** 'xfa' for a script in an XFA form, which runs against the XFA object model instead of Acrobat's. */
+  form: 'acroform' | 'xfa';
 }
 
 export interface ScriptPlugin {
   kind: 'script';
   name: string;
   accepts(script: ContainedScript): boolean | Promise<boolean>;
-  process(script: ContainedScript): Promise<{ result: 'scrubbed' | 'passed' | 'removed'; text?: string }>;
+  /** `findings` are what the plugin found in the script. They go into the report at the script's location. */
+  process(script: ContainedScript): Promise<{ result: 'scrubbed' | 'passed' | 'removed'; text?: string; findings?: DefuseFinding[] }>;
 }
 
 export interface PdfActionOverride {

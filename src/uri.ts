@@ -3,6 +3,8 @@ import { PdfDetail as D } from './types';
 interface UriVerdict {
   /** LINK detail, or JAVASCRIPT URL for javascript: and vbscript: links. */
   detail: D;
+  /** Why a relative link is a PATH_TRICK. */
+  reason?: string;
   host?: string;
   /** For a safe target, the hosts a label is compared with, in order. They do not depend on the label. */
   sites?: string[];
@@ -61,9 +63,16 @@ export function checkUri(rawUri: string, base?: string): UriVerdict {
       if (v.detail !== D.Safe) return v;
       www = v.host;
     }
+    // A relative reference cannot have a colon in its first segment (RFC 3986), and a reader that decodes the address
+    // first, as %6Aavascript: asks it to, reads a scheme there.
+    const head = uri.split(/[/?#]/, 1)[0];
+    if (head.includes(':')) return { detail: D.PathTrick, reason: 'a colon in the first segment, which reads as a scheme once the address is decoded' };
+    const trick = pathTrick(rawUri);
+    if (trick) return { detail: D.PathTrick, reason: trick };
     if (base) {
+      // The base stays in the output, so a link resolved against a hostile one is as hostile as the base.
       const b = checkUri(base);
-      if (b.detail !== D.Safe) return { detail: D.Relative };
+      if (b.detail !== D.Safe) return { detail: b.detail === D.PathTrick ? D.PathTrick : b.detail, reason: b.reason };
       try {
         uri = new URL(uri, base.trim()).toString();
         m = /^([a-zA-Z][a-zA-Z0-9+.-]*):/.exec(uri);
@@ -120,6 +129,40 @@ function hostVerdict(host: string, raw: string): UriVerdict | undefined {
   if (host.startsWith('[') || IPV4.test(host)) return { detail: D.IpHost };
   if (/^\d+$/.test(host) || /^0x[0-9a-f]+$/i.test(host)) return { detail: D.IpHost };
   if (/\P{ASCII}/u.test(host) || host.split('.').some(label => label.startsWith('xn--'))) return { detail: D.LookalikeHost };
+  return undefined;
+}
+
+/**
+ * Why a relative path is written to read as another path, or undefined for an ordinary one. Climbing with .. from the
+ * start, as ../images/a.png does, is ordinary. Odd is a control character a reader drops, a backslash a browser reads
+ * as a slash, an encoded dot, slash, backslash or NUL, a segment of only dots and spaces, which Windows reads as .. or
+ * as nothing, and a path that names a folder and then climbs above where it started. Taken from xml-defuse. An XFA
+ * image name is a Windows path, so `backslash: 'separator'` reads a backslash as one.
+ */
+export function pathTrick(raw: string, opts: { backslash?: 'trick' | 'separator' } = {}): string | undefined {
+  const u = raw.trim();
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: finds the control characters a reader drops from a path.
+  if (/[\x00-\x1f\x7f]/.test(u)) return 'a control character, which readers drop before they read the address';
+  const end = u.search(/[?#]/);
+  let path = end < 0 ? u : u.slice(0, end);
+  if (path.includes('\\')) {
+    if (opts.backslash !== 'separator') return 'a backslash, which browsers read as a slash';
+    path = path.replaceAll('\\', '/');
+  }
+  if (/%(2e|2f|5c|00)/i.test(path)) return 'an encoded dot, slash, backslash or NUL in the path';
+  let depth = 0;
+  let named = false;
+  for (const seg of path.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (depth > 0) depth--;
+      else if (named) return 'a path that names a folder and then climbs above where it started';
+      continue;
+    }
+    if (/^[. ]+$/.test(seg)) return 'a segment of only dots and spaces, which Windows reads as .. or as nothing';
+    depth++;
+    named = true;
+  }
   return undefined;
 }
 

@@ -87,7 +87,7 @@ describe('adversarial: walker rules', () => {
     }).to.deep.equal({ status: 'defused', reported: true, linkActionSurvives: false });
   });
 
-  it('removes XFA from an AcroForm dictionary that a JavaScript-tree navigation action reaches first', async () => {
+  it('removes the scripts of the XFA in an AcroForm dictionary that a JavaScript-tree navigation action reaches first', async () => {
     // prepassDocumentScripts() runs before the catalog. A kept GoTo in the tree enqueues 6 as generic, ahead of the catalog.
     const { pdf } = makeDoc({
       catalog: '/Names << /JavaScript << /Names [(nav) << /S /GoTo /D [3 0 R /Fit] /Foo 6 0 R >>] >> >> /AcroForm 6 0 R',
@@ -99,11 +99,11 @@ describe('adversarial: walker rules', () => {
     const { r, out, bytes } = await run(pdf);
     expect({
       status: r.status,
-      reported: has(r.before, C.Form, D.Xfa),
+      reported: has(r.before, C.JavaScript, D.Xfa),
       xfaSurvives: must(out, 'output scan').keys.has('XFA'),
       jsTreeSurvives: must(out, 'output scan').keys.has('JavaScript'),
       qpdfSeesXfaScript: qpdfDump(must(bytes, 'output bytes')).includes('app.alert(1)'),
-    }).to.deep.equal({ status: 'defused', reported: true, xfaSurvives: false, jsTreeSurvives: false, qpdfSeesXfaScript: false });
+    }).to.deep.equal({ status: 'defused', reported: true, xfaSurvives: true, jsTreeSurvives: false, qpdfSeesXfaScript: false });
   });
 
   it('finds document JavaScript whose name-tree key is a name or an indirect string', async () => {

@@ -4,7 +4,7 @@ import * as zlib from 'node:zlib';
 import { ObjectLimitError, type PdfDocument, TimeLimitError } from './document';
 import { DecompressionLimitError, decodeChunks, filtersOf } from './filters';
 import { type FindingFactory, findingSpec } from './findings';
-import { SpillSink, type TempDir } from './io';
+import { bufferSource, SpillSink, type TempDir } from './io';
 import { decodeTextString, dictOf, encodeTextString, PdfDict, PdfName, type PdfObject, PdfRef, PdfStream, PdfString } from './objects';
 import { sniffType, typeFromName, typesDisagree } from './sniff';
 import {
@@ -14,6 +14,7 @@ import {
   type ContainedFile,
   type ContainedFilePlugin,
   type ContainedFileResult,
+  type ContainedScript,
   PdfDetail as D,
   type DefuseFinding,
   type PdfFinding,
@@ -22,6 +23,7 @@ import {
 } from './types';
 import { checkUri, hostsIn, LabelSites } from './uri';
 import { serialize } from './writer';
+import { applyEdits, escapeXmlText, planXfa, splitEdits, type XfaEdit, type XfaImage, XfaReadError, type XfaScript } from './xfa';
 
 /** What an object is, decided from its own content, never from the path that reached it. */
 type Kind = 'catalog' | 'pagesNode' | 'page' | 'annot' | 'field' | 'acroform' | 'outlineRoot' | 'outline' | 'action' | 'filespec' | 'efStream' | 'structural' | 'generic';
@@ -378,6 +380,14 @@ export class Walker {
     { keep: boolean; replacement?: SpillSink; types?: { declared?: string; sniffed?: string; name?: string; size?: number; plugin?: ContainedFilePlugin; decoded?: Promise<ByteSource> } }
   >();
   private readonly jsReplace = new Map<number, Uint8Array>();
+  /** XFA packet streams with their cleaned text, by object number. */
+  private readonly xfaReplace = new Map<number, Uint8Array>();
+  /** Per XFA entry, by owner and path, the value phase A decided to write, or null when the form goes whole. */
+  private readonly xfaDone = new Map<string, PdfObject | null>();
+  /** Set once an XFA form goes into the output, so the catalog keeps NeedsRendering. */
+  private xfaKept = false;
+  /** XFA packet streams, which stay packets whatever their /Type says. Some producers mark them as embedded files. */
+  private readonly xfaRole = new Set<number>();
   private jsTree?: { entries: Array<[PdfString, PdfObject]> };
   private efTree?: { entries: Array<[PdfString, PdfObject]> };
   private readonly keptDocScripts: string[] = [];
@@ -451,6 +461,13 @@ export class Walker {
     if (f.action === 'info') f.action = 'strip';
     this.push(f);
     return f;
+  }
+
+  /** What a script plugin found in a script, at the script's location unless the plugin gave a finer one. */
+  private pushScript(found: DefuseFinding[] | undefined, location: string): void {
+    for (const f of found ?? []) {
+      this.push({ ...f, action: f.action === 'reject' ? 'strip' : f.action, location: f.location ?? location, data: f.data && { ...f.data } });
+    }
   }
 
   /**
@@ -1094,7 +1111,7 @@ export class Walker {
         return undefined;
       // A stream decided as a contained file stays one, whether or not it says /Type /EmbeddedFile, unless it is a page's
       // content: only the reference that made it a contained file goes then.
-      let kind = obj instanceof PdfStream && this.fileDecisions.has(num) ? 'efStream' : this.kindOf(obj, num, await this.actionType(d));
+      let kind = obj instanceof PdfStream && this.xfaRole.has(num) ? 'generic' : obj instanceof PdfStream && this.fileDecisions.has(num) ? 'efStream' : this.kindOf(obj, num, await this.actionType(d));
       if (kind === 'efStream' && this.contentRole.has(num)) kind = 'generic';
       // Nothing reads a stream encrypted with a key the password does not give, and pdf.js draws a page without it.
       // An attached file reports its own removal.
@@ -1254,14 +1271,12 @@ export class Walker {
         continue;
       }
       if (k === 'XFA') {
-        const f = this.emit(C.Form, D.Xfa, 'form');
-        if (f.action === 'strip') {
-          await this.reach(v);
-          continue;
-        }
+        const x = await this.handleXfa(v, child, owner, p);
+        if (x !== undefined) out.set(k, x);
+        continue;
       }
-      // XFA rendering goes with any rewrite. A file passed through unchanged keeps it, so it is no removal.
-      if (k === 'NeedsRendering' && this.phase === 'B') continue;
+      // XFA rendering goes with the XFA form. A file passed through unchanged keeps it, so it is no removal.
+      if (k === 'NeedsRendering' && this.phase === 'B' && !this.xfaKept) continue;
       if (k === 'Metadata') {
         // XMP, on the catalog, a page, an image or anything else.
         const xmp = this.aggregate(C.Metadata, D.Xmp);
@@ -1530,6 +1545,278 @@ export class Walker {
     }
     await this.alsoAction(d, ctx, owner, path, out, taken);
     return this.handleGeneric(d, { location: 'document names', shadow: ctx.shadow }, owner, path, taken, out);
+  }
+
+  // ---------- XFA ----------
+
+  /**
+   * An XFA form: its packets are read, every script goes to the script plugins, and what reaches outside the form
+   * goes. A form that cannot be read exactly goes whole, and so does every form when FORM/XFA is set to strip.
+   */
+  private async handleXfa(v: PdfObject, ctx: Ctx, owner: string, path: string): Promise<PdfObject | undefined> {
+    const key = owner + path;
+    if (this.phase === 'B') {
+      const done = this.xfaDone.get(key);
+      return done ? this.tv(done, ctx, owner, path) : undefined;
+    }
+    if (ctx.shadow) {
+      await this.reach(v);
+      return undefined;
+    }
+    const cached = this.xfaDone.get(key);
+    if (cached !== undefined) return cached === null ? undefined : this.tv(cached, ctx, owner, path);
+    let out: PdfObject | null = null;
+    if (this.emit(C.Form, D.Xfa, 'form').action !== 'strip') {
+      try {
+        out = await this.cleanXfa(v);
+      } catch (e) {
+        if (e instanceof DecompressionLimitError || e instanceof TimeLimitError || e instanceof ObjectLimitError) throw e;
+        this.passOn(e);
+        const reason = e instanceof XfaReadError ? e.message : `it could not be decoded (${String((e as Error)?.message ?? e).slice(0, 80)})`;
+        this.emitRemoval(C.Form, D.XfaUnreadable, 'form', { reason });
+      }
+    }
+    this.xfaDone.set(key, out);
+    if (out === null) {
+      await this.reach(v);
+      return undefined;
+    }
+    this.xfaKept = true;
+    return this.tv(out, ctx, owner, path);
+  }
+
+  /** Returns the XFA entry to write. Cleaned packet text goes into xfaReplace, keyed by the stream that holds it. */
+  private async cleanXfa(v: PdfObject): Promise<PdfObject> {
+    const streamRef = async (r: PdfObject): Promise<{ ref: PdfRef; stream: PdfStream }> => {
+      if (!(r instanceof PdfRef)) throw new XfaReadError('a packet that is not a stream');
+      let ref = r;
+      let o = await this.doc.getObject(ref);
+      for (let i = 1; i < 32 && o instanceof PdfRef; i++) {
+        ref = o;
+        o = await this.doc.getObject(ref);
+      }
+      if (!(o instanceof PdfStream)) throw new XfaReadError('a packet that is not a stream');
+      if (!this.doc.canDecrypt(o, ref.num)) throw new XfaReadError('a packet encrypted with a key the password does not give');
+      return { ref, stream: o };
+    };
+    const value = await this.doc.resolve(v);
+    const packets: Array<{ name?: PdfObject; ref: PdfRef; stream: PdfStream }> = [];
+    if (value instanceof PdfStream) packets.push(await streamRef(v));
+    else if (Array.isArray(value)) {
+      if (value.length % 2) throw new XfaReadError('a packet array of odd length');
+      for (let i = 0; i < value.length; i += 2) {
+        if (!(value[i] instanceof PdfString)) throw new XfaReadError('a packet without a name');
+        packets.push({ name: value[i], ...(await streamRef(value[i + 1])) });
+      }
+    } else throw new XfaReadError('an XFA entry that is neither a stream nor a packet array');
+    if (new Set(packets.map(p => p.ref.num)).size !== packets.length) throw new XfaReadError('a packet stream listed twice');
+    for (const p of packets) this.xfaRole.add(p.ref.num);
+    const bodies: string[] = [];
+    for (const p of packets) {
+      const bytes = await this.doc.decode(p.stream, p.ref.num, this.options.limits?.decompressedBytes);
+      bodies.push(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.length).toString('latin1'));
+    }
+    const whole = bodies.join('');
+    try {
+      new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(whole, 'latin1'));
+    } catch {
+      throw new XfaReadError('bytes that are not UTF-8');
+    }
+    const plan = planXfa(whole, { stripMetadata: this.options.stripMetadata });
+    const edits: XfaEdit[] = [];
+    const cut: Array<[number, number]> = [];
+    const inCut = (a: number, b: number) => cut.some(([x, y]) => a >= x && b <= y);
+    const where = (packet: string, som: string) => `XFA ${packet}${som ? `, ${som}` : ''}`;
+    for (const r of plan.removals) {
+      if (inCut(r.start, r.end)) continue;
+      const loc = where(r.packet, r.som);
+      const what = short(r.what, 120);
+      const f =
+        r.kind === 'packet'
+          ? this.emit(C.Form, D.XfaPacket, loc, { packet: what })
+          : r.kind === 'submit'
+            ? this.emit(C.Action, D.SubmitForm, loc, { target: what })
+            : r.kind === 'execute'
+              ? this.emit(C.Form, D.XfaExecute, loc, { connection: what })
+              : r.kind === 'connection'
+                ? this.emit(C.Form, D.XfaConnection, loc, { connection: what })
+                : r.kind === 'exObject'
+                  ? this.emit(C.Form, D.XfaExternalObject, loc, { object: what })
+                  : this.emit(C.Form, D.XfaExternalReference, loc, { reference: what });
+      if (f.action !== 'strip') continue;
+      edits.push({ start: r.start, end: r.end, insert: '' });
+      cut.push([r.start, r.end]);
+    }
+    for (const sc of plan.scripts) {
+      if (inCut(sc.start, sc.end)) continue;
+      const d = await this.decideXfaScript(sc);
+      if (!d.keep) edits.push({ start: sc.start, end: sc.end, insert: '' });
+      else if (d.text !== undefined) edits.push({ start: sc.start, end: sc.end, insert: Buffer.from(escapeXmlText(d.text), 'utf8').toString('latin1') });
+    }
+    for (const l of plan.links) {
+      if (inCut(l.start, l.end)) continue;
+      if (!this.decideXfaLink(l.uri, where(l.packet, l.som))) edits.push({ start: l.start, end: l.end, insert: '' });
+    }
+    for (const img of plan.images) {
+      if (inCut(img.start, img.end)) continue;
+      const d = await this.decideXfaImage(img, `${where(img.packet, img.som)}, image`);
+      if (!d.keep) edits.push({ start: img.start, end: img.end, insert: '' });
+      else if (d.data !== undefined) edits.push({ start: img.start, end: img.end, insert: d.data });
+    }
+    if (!edits.length) return v;
+    const bounds = [0];
+    for (const b of bodies) bounds.push(bounds[bounds.length - 1] + b.length);
+    const per = splitEdits(bounds, edits);
+    const kept: PdfObject[] = [];
+    for (let k = 0; k < packets.length; k++) {
+      const p = packets[k];
+      if (per[k].length) {
+        const body = applyEdits(bodies[k], per[k]);
+        // A packet emptied whole goes from the array, name and all.
+        if (packets.length > 1 && !body.trim()) {
+          await this.reach(p.ref);
+          continue;
+        }
+        this.xfaReplace.set(p.ref.num, Buffer.from(body, 'latin1'));
+      }
+      if (p.name) kept.push(p.name, p.ref);
+    }
+    if (value instanceof PdfStream) return v;
+    // The array is written in place, so an array object of its own is no longer referenced.
+    if (v instanceof PdfRef && !this.visited.has(v.num)) this.reached.add(v.num);
+    return kept;
+  }
+
+  /** Runs the script plugins over an XFA script. Returns whether it stays, and its new text when a plugin rewrote it. */
+  private async decideXfaScript(sc: XfaScript): Promise<{ keep: boolean; text?: string }> {
+    const location = `XFA ${sc.packet}${sc.som ? `, ${sc.som}` : ''}, ${sc.activity}`;
+    const trigger = `xfa-${sc.activity}`;
+    const verify = sc.language ? this.cfg.verify?.scripts.get(sc.text) : undefined;
+    if (verify) {
+      this.emit(C.JavaScript, verify.result === 'passed' ? D.PluginPassed : D.PluginScrubbed, location, { plugin: verify.plugin });
+      return { keep: true };
+    }
+    const language = sc.language === 'formcalc' ? 'FormCalc' : sc.language === 'javascript' ? 'JavaScript' : short(sc.contentType || 'an unreadable form', 40);
+    const f = this.cfg.factory.make(C.JavaScript, D.Xfa, location, { trigger, length: sc.text.length, language });
+    let decision: { keep: boolean; text?: string } = { keep: f.action !== 'strip' && sc.language !== undefined };
+    let answer: PdfFinding | undefined;
+    let found: DefuseFinding[] | undefined;
+    if (f.action === 'strip' && sc.language) {
+      for (const plugin of this.options.scriptPlugins ?? []) {
+        const script: ContainedScript = {
+          text: sc.text,
+          trigger,
+          location,
+          fieldName: sc.som || undefined,
+          keptDocumentScripts: [...this.keptDocScripts],
+          language: sc.language,
+          form: 'xfa',
+        };
+        const data = { plugin: plugin.name };
+        try {
+          if (!(await plugin.accepts(script))) continue;
+          const r = await plugin.process(script);
+          if (Array.isArray(r.findings)) found = r.findings;
+          if (r.result === 'passed') {
+            decision = { keep: true };
+            answer = this.cfg.factory.make(C.JavaScript, D.PluginPassed, location, data);
+            this.kept.scripts.set(sc.text, { result: 'passed', plugin: plugin.name });
+          } else if (r.result === 'scrubbed' && typeof r.text === 'string' && r.text.length) {
+            decision = { keep: true, text: r.text };
+            answer = this.cfg.factory.make(C.JavaScript, D.PluginScrubbed, location, data);
+            // Written with its carriage returns as references, so the output check reads back this exact text.
+            this.kept.scripts.set(r.text, { result: 'scrubbed', plugin: plugin.name });
+          } else answer = this.cfg.factory.make(C.JavaScript, r.result === 'removed' ? D.PluginRemoved : D.PluginFailed, location, data);
+        } catch (e) {
+          this.passOn(e);
+          answer = this.cfg.factory.make(C.JavaScript, D.PluginFailed, location, data);
+        }
+        break;
+      }
+      if (decision.keep) f.action = 'info';
+    }
+    // A script in a language no plugin reads goes, whatever the override says.
+    if (!sc.language && f.action === 'info') f.action = 'strip';
+    this.push(f);
+    if (answer) this.push(answer);
+    this.pushScript(found, location);
+    return decision;
+  }
+
+  /**
+   * An image an XFA form carries inline goes to the file plugins, as an attached file does: a viewer decodes it with
+   * decoders of its own. Returns whether it stays, and its new base64 when a plugin rewrote it.
+   */
+  private async decideXfaImage(img: XfaImage, loc: string): Promise<{ keep: boolean; data?: string }> {
+    const type = short(img.contentType, 40);
+    const b64 = img.data.replace(/\s+/g, '');
+    // A last lone character holds six bits, no whole byte, so every decoder reads the same bytes without it.
+    if (img.transferEncoding !== 'base64' || !/^[A-Za-z0-9+/]*={0,2}$/.test(b64)) {
+      this.emitRemoval(C.Form, D.XfaImage, loc, { type, reason: 'Its data is not base64' });
+      return { keep: false };
+    }
+    const bytes = Buffer.from(b64, 'base64');
+    const hash = createHash('md5').update(bytes).digest('hex');
+    const expected = this.cfg.verify?.files.get(hash);
+    if (expected) {
+      this.emit(C.Form, expected.result === 'passed' ? D.PluginPassed : D.PluginScrubbed, loc, { plugin: expected.plugin });
+      this.pushContained(expected.findings, loc, 'XFA image');
+      return { keep: true };
+    }
+    const sniffed = sniffType(bytes.subarray(0, 1024));
+    const file: ContainedFile = { declaredType: img.contentType || undefined, sniffedType: sniffed, size: bytes.length, location: loc, depth: this.cfg.depth + 1, source: bufferSource(bytes) };
+    const context: RunContext = { depth: file.depth, deadline: this.cfg.deadline, [RUN_OPTIONS]: this.options };
+    for (const plugin of this.options.filePlugins ?? []) {
+      try {
+        if (!(await plugin.accepts(file))) continue;
+      } catch (e) {
+        this.passOn(e);
+        continue;
+      }
+      const outSink = new SpillSink(this.cfg.temp, Number.POSITIVE_INFINITY);
+      try {
+        const out = await plugin.process(file, outSink, context);
+        const r: Partial<ContainedFileResult> = typeof out === 'string' ? { result: out } : (out ?? {});
+        await outSink.close();
+        const data = { plugin: plugin.name };
+        const written = outSink.length > 0 ? Buffer.from(await outSink.source().read(0, outSink.length)) : undefined;
+        this.pushContained(r.findings, loc, 'XFA image');
+        if (r.result === 'passed' || (r.result === 'scrubbed' && written)) {
+          this.emit(C.Form, r.result === 'passed' ? D.PluginPassed : D.PluginScrubbed, loc, data);
+          // Bytes the plugin wrote are the ones kept.
+          this.kept.files.set(written ? outSink.digest() : hash, { result: r.result, plugin: plugin.name, findings: r.outputFindings });
+          return { keep: true, data: written && !written.equals(bytes) ? written.toString('base64') : undefined };
+        }
+        this.emitRemoval(C.Form, r.result === 'removed' ? D.PluginRemoved : D.PluginFailed, loc, data);
+        return { keep: false };
+      } catch (e) {
+        this.passOn(e);
+        this.emitRemoval(C.Form, D.PluginFailed, loc, { plugin: plugin.name });
+        return { keep: false };
+      } finally {
+        await outSink.dispose();
+      }
+    }
+    const f = this.emit(C.Form, D.XfaImage, loc, { type: type || sniffed || '' });
+    return { keep: f.action !== 'strip' };
+  }
+
+  /** A link in an XFA form's rich text, checked as a link action's address is. Returns whether it stays. */
+  private decideXfaLink(uri: string, loc: string): boolean {
+    const verdict = checkUri(uri, this.uriBase);
+    if (verdict.detail === D.Safe) {
+      const f = this.aggregate(C.Link, D.Safe, data => {
+        const hosts = String(data.hosts ?? '')
+          .split(', ')
+          .filter(Boolean);
+        if (verdict.host && hosts.length < 20 && !hosts.includes(verdict.host)) hosts.push(verdict.host);
+        data.hosts = hosts.join(', ');
+      });
+      return f.action !== 'strip';
+    }
+    const target = { uri: short(uri, 120), ...(verdict.reason ? { reason: verdict.reason } : {}) };
+    const f = verdict.detail === D.Url ? this.emit(C.JavaScript, D.Url, loc, target) : this.emit(C.Link, verdict.detail, loc, target);
+    return f.action !== 'strip';
   }
 
   private async handleAcroForm(d: PdfDict, ctx: Ctx, owner: string, path: string): Promise<PdfDict> {
@@ -1999,13 +2286,23 @@ export class Walker {
     const f = this.cfg.factory.make(C.JavaScript, ctx.jsDetail ?? D.Annotation, ctx.location, { trigger: ctx.trigger ?? 'unknown', length });
     let decision: { keep: boolean; text?: string } = { keep: f.action !== 'strip' };
     let answer: PdfFinding | undefined;
+    let found: DefuseFinding[] | undefined;
     if (f.action === 'strip' && !ctx.shadow && src !== undefined) {
       for (const plugin of this.options.scriptPlugins ?? []) {
-        const script = { text: src, trigger: ctx.trigger ?? 'unknown', location: ctx.location, fieldName: ctx.fieldName, keptDocumentScripts: [...this.keptDocScripts] };
+        const script: ContainedScript = {
+          text: src,
+          trigger: ctx.trigger ?? 'unknown',
+          location: ctx.location,
+          fieldName: ctx.fieldName,
+          keptDocumentScripts: [...this.keptDocScripts],
+          language: 'javascript',
+          form: 'acroform',
+        };
         const data = { plugin: plugin.name };
         try {
           if (!(await plugin.accepts(script))) continue;
           const r = await plugin.process(script);
+          if (Array.isArray(r.findings)) found = r.findings;
           if (r.result === 'passed') {
             decision = { keep: true };
             answer = this.cfg.factory.make(C.JavaScript, D.PluginPassed, ctx.location, data);
@@ -2035,6 +2332,7 @@ export class Walker {
     }
     this.push(f);
     if (answer) this.push(answer);
+    this.pushScript(found, ctx.location);
     if (first) {
       // One object holds one text, so a different rewrite is a refusal too, and only the slot can report it.
       if (first.keep && (!decision.keep || decision.text !== first.text)) {
@@ -2074,13 +2372,15 @@ export class Walker {
     } else if (again) {
       // Decided again for another slot: only a script can be decided differently, and the rest was settled before.
     } else if (s === 'URI') {
-      // Every reading a reader may take has to pass.
+      // Every reading a reader may take has to pass. A relative reading stays, so it does not end the check.
       const readings = uriReadings(await this.doc.resolve(d.get('URI')));
       let uri = readings[0];
       let verdict = checkUri(uri, this.uriBase);
-      for (let i = 1; i < readings.length && verdict.detail === D.Safe; i++) {
+      for (let i = 1; i < readings.length && (verdict.detail === D.Safe || verdict.detail === D.Relative); i++) {
+        const next = checkUri(readings[i], this.uriBase);
+        if (next.detail === D.Safe && verdict.detail === D.Relative) continue;
         uri = readings[i];
-        verdict = checkUri(uri, this.uriBase);
+        verdict = next;
       }
       if (verdict.detail === D.Safe) {
         // A link being removed for another reason is not "kept", so it is not counted as safe.
@@ -2095,7 +2395,8 @@ export class Walker {
             });
         keep = (f?.action ?? this.cfg.factory.actionFor(C.Link, D.Safe)) !== 'strip';
       } else {
-        const f = verdict.detail === D.Url ? this.emit(C.JavaScript, D.Url, loc, { uri: short(uri, 120) }) : this.emit(C.Link, verdict.detail, loc, { uri: short(uri, 120) });
+        const target = { uri: short(uri, 120), ...(verdict.reason ? { reason: verdict.reason } : {}) };
+        const f = verdict.detail === D.Url ? this.emit(C.JavaScript, D.Url, loc, target) : this.emit(C.Link, verdict.detail, loc, target);
         keep = f.action !== 'strip';
       }
     } else if (s === 'GoTo' || s === 'GoToDp' || s === 'Trans' || s === 'ResetForm' || (s === 'Thread' && !d.has('F')) || (s === 'Named' && NAV_NAMED.has(d.name('N') ?? ''))) {
@@ -2483,6 +2784,7 @@ export class Walker {
   private async writeStream(out: Out, nn: number, s: PdfStream, num: number, mapRef: (r: PdfRef) => PdfRef | null): Promise<void> {
     const dict = s.dict.clone();
     const replaceJs = this.jsReplace.get(num);
+    const replaceXfa = this.xfaReplace.get(num);
     const fileDec = this.fileDecisions.get(num);
     let body: AsyncIterable<Uint8Array> | Uint8Array[];
     let compressed: SpillSink | undefined;
@@ -2492,6 +2794,13 @@ export class Walker {
       dict.delete('DL');
       dict.set('Length', replaceJs.length);
       body = [replaceJs];
+    } else if (replaceXfa) {
+      const z = zlib.deflateSync(replaceXfa);
+      dict.set('Filter', new PdfName('FlateDecode'));
+      dict.delete('DecodeParms');
+      dict.delete('DL');
+      dict.set('Length', z.length);
+      body = [z];
     } else if (fileDec?.replacement) {
       const sink = new SpillSink(this.cfg.temp, this.options.memoryThreshold ?? 8 * 1024 * 1024);
       compressed = sink;
@@ -2564,6 +2873,9 @@ export class Walker {
     this.queue = [];
     this.scriptDecisions.clear();
     this.jsReplace.clear();
+    this.xfaReplace.clear();
+    this.xfaDone.clear();
+    this.xfaRole.clear();
     this.annotPage.clear();
     this.altText.clear();
     this.refusedSlots.clear();

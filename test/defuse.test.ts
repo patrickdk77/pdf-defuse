@@ -159,7 +159,11 @@ describe('defuse rules', () => {
       ['http://10.0.0.1/', D.IpHost],
       ['https://xn--80ak6aa92e.com/', D.LookalikeHost],
       ['https://ex%61mple.com', D.EncodedHost],
-      ['relative/page.html', D.Relative],
+      ['relative/page.html', 'keep'],
+      ['../manual/page.html', 'keep'],
+      ['docs/../../x.pdf', D.PathTrick],
+      ['..\\\\..\\\\calc.exe', D.PathTrick],
+      ['docs/%2e%2e/x.pdf', D.PathTrick],
     ];
     for (const [uri, expected] of cases) {
       const { r, out } = await defuse(makeDoc({ annots: [LINK(`<< /S /URI /URI (${uri}) >>`)] }).pdf);
@@ -371,8 +375,9 @@ describe('defuse rules', () => {
 
   it('honors action overrides', async () => {
     const pdf = makeDoc({ annots: [LINK('<< /S /URI /URI (page.html) >>')] }).pdf;
-    const kept = await disarmPdf(pdf, { actionOverrides: [{ category: C.Link, detail: D.Relative, action: 'info' }] });
-    expect(kept.status).to.equal('clean');
+    expect((await disarmPdf(pdf)).status).to.equal('clean');
+    const stripped = await disarmPdf(pdf, { actionOverrides: [{ category: C.Link, detail: D.Relative, action: 'strip' }] });
+    expect(stripped.status).to.equal('defused');
     const rejected = await disarmPdf(makeDoc({ catalog: '/OpenAction << /S /JavaScript /JS (x) >>' }).pdf, { actionOverrides: [{ category: C.JavaScript, action: 'reject' }] });
     expect(rejected.status).to.equal('rejected');
     expect(rejected.bytes).to.equal(undefined);

@@ -52,6 +52,27 @@ describe('script plugins', () => {
     expect(must(must(r.after, 'after-inspection').score, 'score')).to.be.greaterThan(0);
   });
 
+  it("reports a plugin's findings at the script's location, and keeps a finer location the plugin gave", async () => {
+    const plugin: ScriptPlugin = {
+      kind: 'script',
+      name: 'reasons',
+      accepts: () => true,
+      async process(s) {
+        if (s.trigger === 'field-keystroke') {
+          return { result: 'removed', findings: [{ category: 'SCRIPT_EXTERNAL', detail: 'URL', action: 'strip', description: 'evil opens a web address', data: { api: 'evil' }, weight: 60 }] };
+        }
+        return { result: 'passed', findings: [{ category: 'SCRIPT_FORM', detail: 'COMPUTATION', action: 'info', description: 'A form script', location: `${s.location}, line 1`, weight: 0 }] };
+      },
+    };
+    const r = await disarmPdf(withScripts(), { scriptPlugins: [plugin] });
+    const url = r.before.findings.find(f => f.category === 'SCRIPT_EXTERNAL' && f.detail === 'URL');
+    expect(url?.location).to.equal('field "amount" field-keystroke trigger');
+    expect(url?.action).to.equal('strip');
+    expect(url?.data).to.deep.equal({ api: 'evil' });
+    const formFindings = r.before.findings.filter(f => f.category === 'SCRIPT_FORM');
+    expect(formFindings.map(f => f.location)).to.deep.equal(['document script "lib", line 1', 'field "amount" field-format trigger, line 1']);
+  });
+
   it('removes a script when its plugin throws or returns no text', async () => {
     const throws: ScriptPlugin = {
       kind: 'script',

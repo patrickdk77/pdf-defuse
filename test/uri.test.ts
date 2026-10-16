@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { inspectPdf } from '../src';
 import { PdfCategory as C, PdfDetail as D } from '../src/types';
-import { checkUri, hostsIn } from '../src/uri';
+import { checkUri, hostsIn, pathTrick } from '../src/uri';
 import { LINK, makeDoc } from './helpers/builder';
 import { has } from './helpers/util';
 
@@ -44,11 +44,27 @@ describe('link checks', () => {
     expect(d('https://ex%61mple.com/')).to.equal(D.EncodedHost);
     expect(d('mailto:x@xn--pple-43d.com')).to.equal(D.LookalikeHost);
   });
-  it('resolves relative links against the document base, and flags them without one', () => {
+  it('resolves relative links against the document base, and reports them without one', () => {
     expect(d('page.html')).to.equal(D.Relative);
     expect(d('../../secret.pdf')).to.equal(D.Relative);
     expect(d('page.html', 'https://example.com/docs/')).to.equal(D.Safe);
     expect(checkUri('page.html', 'https://example.com/docs/').host).to.equal('example.com');
+    // The base stays in the output, so a link resolved against a hostile one gets the base's verdict.
+    expect(d('page.html', 'file:///C:/Windows/')).to.equal(D.FileUrl);
+    expect(d('x', 'javascript:app.alert(1)//')).to.equal(D.Url);
+  });
+  it('flags a relative path written to read as another path', () => {
+    expect(d('docs/../../x.pdf')).to.equal(D.PathTrick);
+    expect(d('..\\..\\calc.exe')).to.equal(D.PathTrick);
+    expect(d('docs/%2E%2E/x.pdf')).to.equal(D.PathTrick);
+    expect(d('docs/. ./x.pdf')).to.equal(D.PathTrick);
+    expect(d('docs/\u0001x.pdf')).to.equal(D.PathTrick);
+    expect(d('%6Aavascript:app.alert(1)')).to.equal(D.PathTrick);
+    expect(d('help/page.html?at=10:30')).to.equal(D.Relative);
+    expect(checkUri('a/../../b').reason).to.equal('a path that names a folder and then climbs above where it started');
+    expect(pathTrick('images\\logo.png', { backslash: 'separator' })).to.equal(undefined);
+    expect(pathTrick('..\\images\\logo.png', { backslash: 'separator' })).to.equal(undefined);
+    expect(pathTrick('images\\..\\..\\x.png', { backslash: 'separator' })).to.equal('a path that names a folder and then climbs above where it started');
   });
   it('compares the host with a tooltip that names a site', async () => {
     expect(await withTip('https://evil.example/login', 'Visit www.mybank.com to sign in')).to.equal(D.TextMismatch);

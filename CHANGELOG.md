@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.4 - 2026-10-16
+
+- A script plugin can return `findings` with its result, as a file plugin can. They go into the report at the script's location, unless a finding gives a finer one. A `reject` among them is recorded as `strip`, since the plugin decides one script, not the file.
+- XFA forms stay. pdf-defuse reads each form's XML, hands its JavaScript and FormCalc scripts to the script plugins, and removes the submits, web service calls, data connections, external objects and references outside the PDF. Rich text links get the link checks, and inline images go to the file plugins. The README's XFA forms section has the rules.
+- FORM/XFA is `info` now. An override to `strip` removes XFA forms whole, as before.
+- New findings: JAVASCRIPT/XFA, FORM/XFA_UNREADABLE, FORM/XFA_PACKET, FORM/XFA_EXECUTE, FORM/XFA_CONNECTION, FORM/XFA_EXTERNAL_OBJECT, FORM/XFA_EXTERNAL_REFERENCE and FORM/XFA_IMAGE, with FORM/PLUGIN_PASSED, PLUGIN_SCRUBBED, PLUGIN_REMOVED and PLUGIN_FAILED for images.
+- The script a script plugin receives has `language`, `javascript` or `formcalc`, and `form`, `acroform` or `xfa`.
+- The catalog keeps `/NeedsRendering` when the XFA form stays.
+- A stream in an XFA packet array stays a packet whatever its `/Type` says. Some producers mark packets as embedded files.
+- Relative links stay. LINK/RELATIVE is `info` now, and an override to `strip` removes relative links as before.
+- LINK/PATH_TRICK removes a relative link whose path is written to read as another path, and says why in `reason`.
+- A relative link resolved against a hostile `/URI /Base` gets the base's verdict, since the base stays in the output.
+- Every reading of a link's address is checked, even after one reads as relative. A name such as `/javascript:x` reads both ways.
+
 ## 0.2.3 - 2026-10-11
 
 - `detectPdf` and `detectPdfSource` tell a router whether pdf-defuse reads a file. A header in the first 1024 bytes decides. Without one, a file whose name or declared type says PDF counts when it opens as one, as pdf.js reads it.
