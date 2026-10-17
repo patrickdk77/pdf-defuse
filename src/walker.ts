@@ -212,7 +212,10 @@ function uriReadings(u: PdfObject | undefined): string[] {
 interface KeptItem {
   result: 'passed' | 'scrubbed';
   plugin: string;
-  /** For a file: the findings inside the kept bytes, which go into the output's report. */
+  /**
+   * What goes into the output's report for it: for a file, the findings inside the kept bytes, and for a script the
+   * plugin passed, what the plugin found in it.
+   */
   findings?: DefuseFinding[];
 }
 
@@ -346,6 +349,8 @@ export class Walker {
   private againBudget = 16 * 1024 * 1024;
   /** A script's findings from visits of removed content, held until the walk ends so a later real visit that keeps it can correct them. */
   private readonly shadowScripts = new Map<string, PdfFinding[]>();
+  /** Scripts a plugin answered for. Its answer is final, so what a shadow visit made of them is not reported. */
+  private readonly answeredScripts = new Set<string>();
   /** Information dictionaries and XMP streams removed for the caller. */
   private readonly strippedMeta = new Set<number>();
   /** Bytes of scrubbed attachments held in memory until the write. */
@@ -982,7 +987,7 @@ export class Walker {
       if (d.types) d.types.decoded = undefined;
       await (await decoded?.catch(() => undefined))?.close?.();
     }
-    for (const list of this.shadowScripts.values()) for (const f of list) this.push(f);
+    for (const [key, list] of this.shadowScripts) if (!this.answeredScripts.has(key)) for (const f of list) this.push(f);
     if (this.dropped.size || this.refusedSlots.size) this.removedAt ??= 'document';
     if (this.coPresent && this.calcRemoved && this.keptCalcFields.size === 0) this.emit(C.Form, D.CalculationOrder, 'form');
     if (doc.issues.escapedNames.size) this.emit(C.Structure, D.EscapedNames, undefined, { names: [...doc.issues.escapedNames].slice(0, 10).join(', ') });
@@ -1694,6 +1699,7 @@ export class Walker {
     const verify = sc.language ? this.cfg.verify?.scripts.get(sc.text) : undefined;
     if (verify) {
       this.emit(C.JavaScript, verify.result === 'passed' ? D.PluginPassed : D.PluginScrubbed, location, { plugin: verify.plugin });
+      this.pushScript(verify.findings, location);
       return { keep: true };
     }
     const language = sc.language === 'formcalc' ? 'FormCalc' : sc.language === 'javascript' ? 'JavaScript' : short(sc.contentType || 'an unreadable form', 40);
@@ -1701,6 +1707,7 @@ export class Walker {
     let decision: { keep: boolean; text?: string } = { keep: f.action !== 'strip' && sc.language !== undefined };
     let answer: PdfFinding | undefined;
     let found: DefuseFinding[] | undefined;
+    let answered = false;
     if (f.action === 'strip' && sc.language) {
       for (const plugin of this.options.scriptPlugins ?? []) {
         const script: ContainedScript = {
@@ -1717,10 +1724,11 @@ export class Walker {
           if (!(await plugin.accepts(script))) continue;
           const r = await plugin.process(script);
           if (Array.isArray(r.findings)) found = r.findings;
+          answered = r.result === 'passed' || r.result === 'removed' || (r.result === 'scrubbed' && typeof r.text === 'string' && r.text.length > 0);
           if (r.result === 'passed') {
             decision = { keep: true };
             answer = this.cfg.factory.make(C.JavaScript, D.PluginPassed, location, data);
-            this.kept.scripts.set(sc.text, { result: 'passed', plugin: plugin.name });
+            this.kept.scripts.set(sc.text, { result: 'passed', plugin: plugin.name, findings: found });
           } else if (r.result === 'scrubbed' && typeof r.text === 'string' && r.text.length) {
             decision = { keep: true, text: r.text };
             answer = this.cfg.factory.make(C.JavaScript, D.PluginScrubbed, location, data);
@@ -1729,17 +1737,19 @@ export class Walker {
           } else answer = this.cfg.factory.make(C.JavaScript, r.result === 'removed' ? D.PluginRemoved : D.PluginFailed, location, data);
         } catch (e) {
           this.passOn(e);
+          answered = false;
           answer = this.cfg.factory.make(C.JavaScript, D.PluginFailed, location, data);
         }
         break;
       }
-      if (decision.keep) f.action = 'info';
     }
     // A script in a language no plugin reads goes, whatever the override says.
     if (!sc.language && f.action === 'info') f.action = 'strip';
-    this.push(f);
+    // A plugin's answer is final: the report holds the answer and what the plugin found, at the plugin's weights, and
+    // nothing of this package's own. Its own finding stands when no plugin answered.
+    if (!answered) this.push(f);
     if (answer) this.push(answer);
-    this.pushScript(found, location);
+    if (answered) this.pushScript(found, location);
     return decision;
   }
 
@@ -2277,6 +2287,7 @@ export class Walker {
     const verify = src !== undefined ? this.cfg.verify?.scripts.get(src) : undefined;
     if (verify) {
       this.emit(C.JavaScript, verify.result === 'passed' ? D.PluginPassed : D.PluginScrubbed, ctx.location, { plugin: verify.plugin });
+      this.pushScript(verify.findings, ctx.location);
       if (first) return first;
       const d = { keep: true };
       this.scriptDecisions.set(key, d);
@@ -2287,6 +2298,7 @@ export class Walker {
     let decision: { keep: boolean; text?: string } = { keep: f.action !== 'strip' };
     let answer: PdfFinding | undefined;
     let found: DefuseFinding[] | undefined;
+    let answered = false;
     if (f.action === 'strip' && !ctx.shadow && src !== undefined) {
       for (const plugin of this.options.scriptPlugins ?? []) {
         const script: ContainedScript = {
@@ -2303,10 +2315,11 @@ export class Walker {
           if (!(await plugin.accepts(script))) continue;
           const r = await plugin.process(script);
           if (Array.isArray(r.findings)) found = r.findings;
+          answered = r.result === 'passed' || r.result === 'removed' || (r.result === 'scrubbed' && typeof r.text === 'string' && r.text.length > 0);
           if (r.result === 'passed') {
             decision = { keep: true };
             answer = this.cfg.factory.make(C.JavaScript, D.PluginPassed, ctx.location, data);
-            if (!first) this.kept.scripts.set(src, { result: 'passed', plugin: plugin.name });
+            if (!first) this.kept.scripts.set(src, { result: 'passed', plugin: plugin.name, findings: found });
           } else if (r.result === 'scrubbed' && typeof r.text === 'string' && r.text.length) {
             decision = { keep: true, text: r.text };
             answer = this.cfg.factory.make(C.JavaScript, D.PluginScrubbed, ctx.location, data);
@@ -2317,11 +2330,11 @@ export class Walker {
           } else answer = this.cfg.factory.make(C.JavaScript, r.result === 'removed' ? D.PluginRemoved : D.PluginFailed, ctx.location, data);
         } catch (e) {
           this.passOn(e);
+          answered = false;
           answer = this.cfg.factory.make(C.JavaScript, D.PluginFailed, ctx.location, data);
         }
         break;
       }
-      if (decision.keep) f.action = 'info';
     }
     if (ctx.shadow) {
       // Recorded when the walk ends, after any real visit that keeps the script has corrected it.
@@ -2330,9 +2343,12 @@ export class Walker {
       else this.shadowScripts.set(key, [f]);
       return { keep: false };
     }
-    this.push(f);
+    // A plugin's answer is final: the report holds the answer and what the plugin found, at the plugin's weights, and
+    // nothing of this package's own. Its own finding stands when no plugin answered.
+    if (answered) this.answeredScripts.add(key);
+    else this.push(f);
     if (answer) this.push(answer);
-    this.pushScript(found, ctx.location);
+    if (answered) this.pushScript(found, ctx.location);
     if (first) {
       // One object holds one text, so a different rewrite is a refusal too, and only the slot can report it.
       if (first.keep && (!decision.keep || decision.text !== first.text)) {

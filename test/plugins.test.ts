@@ -49,7 +49,10 @@ describe('script plugins', () => {
     expect(out.strings).to.include('function helper(){}');
     expect(out.strings).to.include('AFNumber_Format(0);');
     expect(out.strings).to.not.include('evil()');
-    expect(must(must(r.after, 'after-inspection').score, 'score')).to.be.greaterThan(0);
+    // The plugin answered for every script, so the report holds its answers and nothing of pdf-defuse's own, and
+    // they score what the plugin found in them: nothing.
+    expect(r.before.findings.filter(f => f.category === C.JavaScript).every(f => f.detail.startsWith('PLUGIN_'))).to.equal(true);
+    expect([r.before.score, must(r.after, 'after-inspection').score]).to.deep.equal([0, 0]);
   });
 
   it("reports a plugin's findings at the script's location, and keeps a finer location the plugin gave", async () => {
@@ -71,6 +74,38 @@ describe('script plugins', () => {
     expect(url?.data).to.deep.equal({ api: 'evil' });
     const formFindings = r.before.findings.filter(f => f.category === 'SCRIPT_FORM');
     expect(formFindings.map(f => f.location)).to.deep.equal(['document script "lib", line 1', 'field "amount" field-format trigger, line 1']);
+  });
+
+  it("scores a script a plugin answered for by the plugin's findings alone, and its own finding only when no plugin answered", async () => {
+    const form = { category: 'SCRIPT_FORM', detail: 'COMPUTATION', action: 'info' as const, description: 'A form script', weight: 0 };
+    const url = { category: 'SCRIPT_EXTERNAL', detail: 'URL', action: 'strip' as const, description: 'Opens a web address', weight: 35 };
+    const answer = (result: 'passed' | 'removed', finding: typeof form | typeof url): ScriptPlugin => ({
+      kind: 'script',
+      name: 'scorer',
+      accepts: () => true,
+      process: async () => ({ result, findings: [{ ...finding }] }),
+    });
+    const kept = await disarmPdf(withScripts(), { scriptPlugins: [answer('passed', form)] });
+    const removed = await inspectPdf(withScripts(), { scriptPlugins: [answer('removed', url)] });
+    const failed = await inspectPdf(withScripts(), { scriptPlugins: [{ kind: 'script', name: 'boom', accepts: () => true, process: async () => ({ result: 'unknown' as 'passed' }) }] });
+    const none = await inspectPdf(withScripts());
+    const own = (findings: Array<{ category: string; detail: string }>) => findings.filter(f => f.category === C.JavaScript && !f.detail.startsWith('PLUGIN_')).length;
+    expect({
+      kept: [kept.before.status, kept.before.risk, kept.before.score, own(kept.before.findings), must(kept.after, 'after').score],
+      removed: [removed.status, removed.score, own(removed.findings)],
+      failed: [failed.status, failed.score, own(failed.findings)],
+      none: [none.status, none.score, own(none.findings)],
+    }).to.deep.equal({
+      kept: ['clean', 'NONE', 0, 0, 0],
+      // The plugin's 35, not the 70 of pdf-defuse's own document-script finding.
+      removed: ['strippable', 35, 0],
+      failed: ['strippable', 83, 3],
+      none: ['strippable', 83, 3],
+    });
+    // An attached PDF hands its container the same weights, so a kept script adds nothing there either.
+    const outer = attach('form.pdf', 'application/pdf', withScripts());
+    const nested = await inspectPdf(outer, { filePlugins: [pdfPlugin({ scriptPlugins: [answer('passed', form)] })] });
+    expect([nested.status, nested.score, nested.findings.filter(f => f.attachment && (f.weight ?? 0) > 0)]).to.deep.equal(['clean', 0, []]);
   });
 
   it('removes a script when its plugin throws or returns no text', async () => {
@@ -235,6 +270,9 @@ describe('file plugins', () => {
       const r = await disarmPdf(attach('notes.txt', 'text/plain', 'hello'), { filePlugins: [p] });
       expect(has(r.before, C.EmbeddedFile, detail), result).to.equal(true);
       expect((await scan(Buffer.from(must(r.bytes, 'output bytes')))).keys.has('EF'), result).to.equal(false);
+      // A plugin that removed the file answered for it and found nothing. One that failed did not answer, so the file
+      // scores as one no plugin accepts.
+      expect(r.before.score, result).to.equal(result === 'removed' ? 0 : 30);
     }
   });
 

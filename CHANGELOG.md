@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 - 2026-10-17
+
+- A plugin's answer is final. A script a plugin passed, scrubbed or removed is reported by JAVASCRIPT/PLUGIN_PASSED, PLUGIN_SCRUBBED or PLUGIN_REMOVED and the plugin's findings alone. 0.2.4 also reported pdf-defuse's own finding for it, such as JAVASCRIPT/FIELD, and scored it at pdf-defuse's weight, so a form whose scripts script-defuse kept scored HIGH. It now scores 0 when the plugin finds nothing.
+- PLUGIN_PASSED and PLUGIN_SCRUBBED weigh 0, in the upload's score and the output's. The output's score counted them before. A script or file a plugin kept now scores what the plugin found in it, and those weights also go to a container through `pdfPlugin`.
+- The output's report holds again what a script plugin found in a script it passed, as it does for a file a plugin kept.
+- EMBEDDED_FILE/PLUGIN_FAILED weighs 30 and FORM/PLUGIN_FAILED 20, what EMBEDDED_FILE/NO_PLUGIN and FORM/XFA_IMAGE weigh, since no plugin answered for the file. Both weighed 0.
+
 ## 0.2.4 - 2026-10-16
 
 - A script plugin can return `findings` with its result, as a file plugin can. They go into the report at the script's location, unless a finding gives a finer one. A `reject` among them is recorded as `strip`, since the plugin decides one script, not the file.

@@ -140,6 +140,8 @@ The score runs from 0 to 100. Each kind of finding has a weight: a launch action
 
 `scoreWeights` comes first, then the built-in weights. A kind of finding pdf-defuse does not know, such as one another package's plugin returned, scores at its `weight`, or 0 without one.
 
+A script or file a plugin answered for scores only by the findings the plugin returned, at their weights. pdf-defuse adds nothing of its own for it, and the PLUGIN_PASSED and PLUGIN_SCRUBBED findings that record the answer weigh 0, in the upload's score and in the output's. A form whose scripts a plugin keeps, and in which the plugin finds nothing, scores 0. With no plugin to judge them, the same scripts score at pdf-defuse's own weights.
+
 The bands are NONE at 0, LOW from 1, MEDIUM from 25, HIGH from 50 and CRITICAL from 80.
 
 A run that stops before it has seen the whole file rejects the file with a null score and the UNKNOWN level. Runs stop at a limit, at encryption they cannot open, and at a file they cannot parse or that ends before its trailer. A file with no page to read gets the same result. This holds whatever `actionOverrides` say, because an override can make the finding that stopped the run look harmless. A file rejected for what it holds, for example JavaScript under an override that rejects it, keeps its score. So does a file whose output failed its own inspection.
@@ -178,7 +180,9 @@ A file that encrypts only its attached files, through a crypt filter with `/Auth
 
 ## Plugins
 
-Attached files and scripts are removed unless a plugin keeps them. A plugin says which files or scripts it accepts, then scrubs them, passes them through unchanged, or removes them after all. The first plugin that accepts handles it. If a plugin throws, or scrubs and writes nothing, the item is removed. An error with a `DEFUSE_LIMIT` or `DEFUSE_IO` code stops the whole run instead, as described under The defuse family. A file plugin that passes a file keeps its original bytes, or the bytes it wrote to the sink if it wrote any.
+Attached files and scripts are removed unless a plugin keeps them. A plugin says which files or scripts it accepts, then scrubs them, passes them through unchanged, or removes them after all. The first plugin that accepts handles it. If a plugin throws, or scrubs and writes nothing, the item is removed.
+
+The plugin's answer is final. For a script, the report then holds JAVASCRIPT/PLUGIN_PASSED, PLUGIN_SCRUBBED or PLUGIN_REMOVED and the plugin's findings, and none of pdf-defuse's own, such as JAVASCRIPT/OPEN_ACTION. An attached file gets EMBEDDED_FILE/PLUGIN_PASSED, PLUGIN_SCRUBBED or PLUGIN_REMOVED and the plugin's findings. pdf-defuse reports an item itself only when no plugin answered: a script no plugin accepts gets its JAVASCRIPT finding, and one whose plugin failed gets that finding and JAVASCRIPT/PLUGIN_FAILED. A file no plugin accepts is EMBEDDED_FILE/NO_PLUGIN, and a file whose plugin failed is EMBEDDED_FILE/PLUGIN_FAILED, which weighs what NO_PLUGIN does. An error with a `DEFUSE_LIMIT` or `DEFUSE_IO` code stops the whole run instead, as described under The defuse family. A file plugin that passes a file keeps its original bytes, or the bytes it wrote to the sink if it wrote any.
 
 Five plugins are bundled:
 
@@ -250,7 +254,7 @@ const scriptPlugin = {
 };
 ```
 
-A script plugin can also return `findings` with its result, saying what it found in the script. They go into the report at the script's location, unless a finding gives a finer one, such as the line. A `reject` among them is recorded as `strip`, since the plugin decides one script, not the file. [script-defuse](https://github.com/patrickdk77/script-defuse)'s `formScriptPlugin` keeps form calculations, formats and checks, and reports why it removed every other script.
+A script plugin can also return `findings` with its result, saying what it found in the script. They go into the report at the script's location, unless a finding gives a finer one, such as the line. A `reject` among them is recorded as `strip`, since the plugin decides one script, not the file. Their `weight` is what they add to the score. For a script the plugin passed, the output's report holds them again. [script-defuse](https://github.com/patrickdk77/script-defuse)'s `formScriptPlugin` keeps form calculations, formats and checks, and reports why it removed every other script.
 
 ## The defuse family
 

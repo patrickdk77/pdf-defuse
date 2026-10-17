@@ -54,8 +54,8 @@ def(C.JavaScript, D.Rendition, 'strip', 50, 'A media action carries JavaScript')
 def(C.JavaScript, D.Url, 'strip', 50, 'A link uses a javascript: URL');
 def(C.JavaScript, D.Unattached, 'strip', 50, 'A JavaScript entry sits outside any action');
 def(C.JavaScript, D.Xfa, 'strip', 50, 'An XFA form script, in <language>, runs on a form event');
-def(C.JavaScript, D.PluginPassed, 'info', 40, 'JavaScript kept unchanged by plugin <plugin>');
-def(C.JavaScript, D.PluginScrubbed, 'info', 20, 'JavaScript rewritten and kept by plugin <plugin>');
+def(C.JavaScript, D.PluginPassed, 'info', 0, 'JavaScript kept unchanged by plugin <plugin>');
+def(C.JavaScript, D.PluginScrubbed, 'info', 0, 'JavaScript rewritten and kept by plugin <plugin>');
 def(C.JavaScript, D.PluginFailed, 'strip', 0, 'Plugin <plugin> failed, so the JavaScript was removed');
 def(C.JavaScript, D.PluginRemoved, 'strip', 0, 'JavaScript removed by plugin <plugin>');
 // ACTION
@@ -92,9 +92,9 @@ def(
   40,
   'The types of <attached file "{name}"|an unnamed attached file> disagree: <its name says {nameType}|its name has no known extension>, <it is declared {declared}|it has no declared type>, and <its content looks like {sniffed}|its content is not recognized>',
 );
-def(C.EmbeddedFile, D.PluginPassed, 'info', 20, 'Attached file kept by plugin <plugin> with nothing removed');
-def(C.EmbeddedFile, D.PluginScrubbed, 'info', 10, 'Attached file cleaned and kept by plugin <plugin>');
-def(C.EmbeddedFile, D.PluginFailed, 'strip', 0, 'Plugin <plugin> failed, so the attached file was removed');
+def(C.EmbeddedFile, D.PluginPassed, 'info', 0, 'Attached file kept by plugin <plugin> with nothing removed');
+def(C.EmbeddedFile, D.PluginScrubbed, 'info', 0, 'Attached file cleaned and kept by plugin <plugin>');
+def(C.EmbeddedFile, D.PluginFailed, 'strip', 30, 'Plugin <plugin> failed, so the attached file was removed');
 def(C.EmbeddedFile, D.PluginRemoved, 'strip', 0, 'Attached file removed by plugin <plugin>');
 def(C.EmbeddedFile, D.Portfolio, 'strip', 30, 'PDF is a portfolio of files');
 // MEDIA
@@ -117,9 +117,9 @@ def(C.Form, D.XfaConnection, 'strip', 40, 'An XFA form connects to a web service
 def(C.Form, D.XfaExternalObject, 'strip', 60, 'An XFA form embeds an external object');
 def(C.Form, D.XfaExternalReference, 'strip', 40, 'An XFA form names something outside the PDF to load');
 def(C.Form, D.XfaImage, 'strip', 20, 'An XFA form image (<type|unknown type>) removed. <reason|No plugin accepts this type>');
-def(C.Form, D.PluginPassed, 'info', 10, 'XFA form image kept by plugin <plugin> with nothing removed');
-def(C.Form, D.PluginScrubbed, 'info', 5, 'XFA form image cleaned and kept by plugin <plugin>');
-def(C.Form, D.PluginFailed, 'strip', 0, 'Plugin <plugin> failed, so the XFA form image was removed');
+def(C.Form, D.PluginPassed, 'info', 0, 'XFA form image kept by plugin <plugin> with nothing removed');
+def(C.Form, D.PluginScrubbed, 'info', 0, 'XFA form image cleaned and kept by plugin <plugin>');
+def(C.Form, D.PluginFailed, 'strip', 20, 'Plugin <plugin> failed, so the XFA form image was removed');
 def(C.Form, D.PluginRemoved, 'strip', 0, 'XFA form image removed by plugin <plugin>');
 def(C.Form, D.CalculationOrder, 'strip', 20, 'Form calculation order removed with the calculation scripts it ran');
 // SIGNATURE

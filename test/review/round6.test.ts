@@ -180,7 +180,8 @@ describe('review: round 6', function () {
       got[name] = {
         status: i.status,
         pages: i.pages,
-        script: i.findings.some(f => f.category === C.JavaScript && f.detail === D.OpenAction),
+        // The plugin read the script and removed it; its answer is what the report holds.
+        script: i.findings.some(f => f.category === C.JavaScript && f.detail === D.PluginRemoved),
         direct: reasons(i).includes('streams written inside other objects'),
         input: { script: (await pdfjsScripts(pdf)).document, text: (await pdfjsText(pdf)).text },
         output: d.bytes ? { script: (await pdfjsScripts(d.bytes)).document, text: (await pdfjsText(d.bytes)).text } : null,

@@ -432,16 +432,16 @@ describe('review: round 2 (walker and engine)', function () {
     const pdf = makeDoc({ annots: Array.from({ length: 250 }, (_, i) => LINK(`<< /S /JavaScript /JS (s${i}\\(\\)) >>`, `[${i % 500} 0 ${(i % 500) + 1} 1]`)) }).pdf;
     const kept = await disarmPdf(pdf, { scriptPlugins: [passAll] });
     const removed = await inspectPdf(pdf);
-    const more = (findings: DefuseFinding[]) => findings.find(f => f.detail === D.Link && f.location === 'additional occurrences');
-    // A clean file is rewritten too, so its bytes change.
+    const more = (findings: DefuseFinding[], detail: D) => findings.find(f => f.detail === detail && f.location === 'additional occurrences');
+    // A clean file is rewritten too, so its bytes change. A kept script is reported by the plugin's answer alone.
     expect({
       kept: {
         status: kept.status,
-        action: more(kept.before.findings)?.action,
-        count: more(kept.before.findings)?.data?.count,
+        action: more(kept.before.findings, D.PluginPassed)?.action,
+        count: more(kept.before.findings, D.PluginPassed)?.data?.count,
         same: Buffer.compare(Buffer.from(must(kept.bytes, 'output bytes')), pdf) === 0,
       },
-      removed: { status: removed.status, action: more(removed.findings)?.action, count: more(removed.findings)?.data?.count },
+      removed: { status: removed.status, action: more(removed.findings, D.Link)?.action, count: more(removed.findings, D.Link)?.data?.count },
     }).to.deep.equal({ kept: { status: 'clean', action: 'info', count: 50, same: false }, removed: { status: 'strippable', action: 'strip', count: 50 } });
   });
 

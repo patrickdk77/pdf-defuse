@@ -174,7 +174,7 @@ describe('review 2d: command-line tool', function () {
     }).to.deep.equal({
       flagFirst: ['METADATA/STRIPPED'],
       flagLast: ['METADATA/STRIPPED'],
-      pluginThenOther: { code: 0, findings: ['JAVASCRIPT/OPEN_ACTION', 'JAVASCRIPT/PLUGIN_PASSED'] },
+      pluginThenOther: { code: 0, findings: ['JAVASCRIPT/PLUGIN_PASSED'] },
       limitsMerge: { code: 2, findings: ['LIMIT/OBJECT_COUNT'] },
     });
   });

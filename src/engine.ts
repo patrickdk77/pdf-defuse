@@ -55,8 +55,6 @@ function encryptionFindings(doc: PdfDocument, factory: FindingFactory): PdfFindi
   return out;
 }
 
-const PLUGIN_KEPT = new Set<string>([D.PluginPassed, D.PluginScrubbed]);
-
 /**
  * `incomplete` marks a run that could not inspect the file: it stopped early, or found no page to read. finish()
  * then rejects it without a score, whatever the actions say, because an override can make the finding that stopped
@@ -68,8 +66,9 @@ function finish(findings: DefuseFinding[], options: PdfOptions, incomplete: bool
   // In an upload, a plugin rewrite or a metadata strip changes the file, so the output must be written.
   // In an output being verified, the change is already there.
   const strippable = findings.some(f => f.action === 'strip' || (!isOutput && (f.detail === D.PluginScrubbed || f.detail === D.Stripped)));
-  // The upload's score leaves out what plugins kept; the output's score counts it.
-  const { score, risk } = scoreFindings(isOutput ? findings : findings.filter(f => !PLUGIN_KEPT.has(f.detail)), options);
+  // What a plugin decided counts at the weights of the plugin's own findings; the PLUGIN_* findings that record its
+  // answer weigh nothing.
+  const { score, risk } = scoreFindings(findings, options);
   return { status: rejected ? 'rejected' : strippable ? 'strippable' : 'clean', score, risk, findings, version, pages };
 }
 
