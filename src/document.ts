@@ -505,7 +505,7 @@ export class PdfDocument {
     this.checkedEntries = new Map();
     try {
       await this.findPage(top, pages, 0, counts);
-      const count = await this.fetch(pages.get('Count'));
+      const count = await this.readEntry(pages.get('Count'));
       if (typeof count === 'number' && Number.isInteger(count) && (count <= 1 || (await this.findPage(top, pages, count - 1, counts)))) return false;
       await this.readAllPages(top, pages);
       return false;
@@ -541,7 +541,7 @@ export class PdfDocument {
         }
         if (seen.has(k)) return false;
         seen.add(k);
-        const obj = await this.fetch(node);
+        const obj = await this.readEntry(node);
         if (obj instanceof PdfDict && (await this.isPageNode(obj))) {
           if (!counts.has(k)) counts.set(k, 1);
           if (current++ === index) return true;
@@ -549,7 +549,7 @@ export class PdfDocument {
         continue;
       }
       if (!(node instanceof PdfDict)) return false;
-      const count = await this.fetch(node.get('Count'));
+      const count = await this.readEntry(node.get('Count'));
       if (typeof count === 'number' && Number.isInteger(count) && count >= 0) {
         if (id !== undefined && !counts.has(id)) counts.set(id, count);
         if (current + count <= index) {
@@ -557,7 +557,7 @@ export class PdfDocument {
           continue;
         }
       }
-      const kids = await this.fetch(node.get('Kids'));
+      const kids = await this.readEntry(node.get('Kids'));
       if (Array.isArray(kids)) {
         steps += kids.length;
         for (let i = kids.length - 1; i >= 0; i--) stack.push({ node: kids[i] });
@@ -576,7 +576,7 @@ export class PdfDocument {
       this.checkTime();
       const item = queue.at(-1);
       if (item === undefined) return;
-      const kids = await this.fetch(item.node.get('Kids'));
+      const kids = await this.readEntry(item.node.get('Kids'));
       if (!Array.isArray(kids)) {
         await this.isPageNode(item.node);
         return;
@@ -589,7 +589,7 @@ export class PdfDocument {
       if (kid instanceof PdfRef) {
         if (seen.has(refKey(kid))) return;
         seen.add(refKey(kid));
-        kid = await this.fetch(kid);
+        kid = await this.readEntry(kid);
       }
       if (!(kid instanceof PdfDict)) return;
       if (!(await this.isPageNode(kid))) queue.push({ node: kid, at: 0 });
@@ -598,12 +598,12 @@ export class PdfDocument {
 
   /** A node typed /Page, or any node without /Kids, is a page to pdf.js. */
   private async isPageNode(d: PdfDict): Promise<boolean> {
-    const type = await this.fetch(d.get('Type'));
+    const type = await this.readEntry(d.get('Type'));
     return (type instanceof PdfName && type.name === 'Page') || !d.has('Kids');
   }
 
   /** Reads a value one level deep, as pdf.js reads one on its way to a page. Throws BrokenEntry where pdf.js would. */
-  private async fetch(v: PdfObject | undefined): Promise<PdfObject | undefined> {
+  private async readEntry(v: PdfObject | undefined): Promise<PdfObject | undefined> {
     if (!(v instanceof PdfRef)) return v;
     let broken = this.checkedEntries?.get(refKey(v));
     if (broken === undefined) {
@@ -1212,11 +1212,11 @@ export class PdfDocument {
         for (const d of dicts) {
           let valid: boolean;
           try {
-            const root = await this.fetchStrict(d.get('Root'), fallback);
+            const root = await this.readEntryStrict(d.get('Root'), fallback);
             if (!(root instanceof PdfDict)) continue;
-            const pages = await this.fetchStrict(root.get('Pages'), fallback);
+            const pages = await this.readEntryStrict(root.get('Pages'), fallback);
             if (!(pages instanceof PdfDict)) continue;
-            valid = Number.isInteger(await this.fetchStrict(pages.get('Count'), fallback));
+            valid = Number.isInteger(await this.readEntryStrict(pages.get('Count'), fallback));
           } catch (e) {
             if (!(e instanceof BrokenEntry)) throw e;
             failed = true;
@@ -1231,7 +1231,7 @@ export class PdfDocument {
   }
 
   /** Reads a value one level deep, throwing BrokenEntry where pdf.js's lookup throws. */
-  private async fetchStrict(v: PdfObject | undefined, fallback: boolean): Promise<PdfObject | undefined> {
+  private async readEntryStrict(v: PdfObject | undefined, fallback: boolean): Promise<PdfObject | undefined> {
     if (!(v instanceof PdfRef)) return v;
     const entry = unpack(this.xref.get(v.num));
     if (!entry) return null;

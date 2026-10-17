@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1 - 2026-10-17
+
+- The private method that resolves a PDF reference is `readEntry`, not `fetch`. Security scanners took the old name, borrowed from pdf.js's `xref.fetch`, for network access. pdf-defuse never used the network, and nothing else changes.
+
 ## 0.3.0 - 2026-10-17
 
 - A plugin's answer is final. A script a plugin passed, scrubbed or removed is reported by JAVASCRIPT/PLUGIN_PASSED, PLUGIN_SCRUBBED or PLUGIN_REMOVED and the plugin's findings alone. 0.2.4 also reported pdf-defuse's own finding for it, such as JAVASCRIPT/FIELD, and scored it at pdf-defuse's weight, so a form whose scripts script-defuse kept scored HIGH. It now scores 0 when the plugin finds nothing.
