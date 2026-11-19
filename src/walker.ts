@@ -393,6 +393,13 @@ export class Walker {
   private xfaKept = false;
   /** XFA packet streams, which stay packets whatever their /Type says. Some producers mark them as embedded files. */
   private readonly xfaRole = new Set<number>();
+  /**
+   * The catalog's XFAImages name tree: every entry found, then, once an XFA form decides them, the entries kept and
+   * their keys. A viewer shows these images where an XFA image href names the key.
+   */
+  private xfaImages?: { found: Array<[PdfString, PdfObject]>; entries: Array<[PdfString, PdfObject]>; keys?: Set<string> };
+  /** XFAImages streams a plugin kept, which stay plain streams whatever their dictionary says. */
+  private readonly xfaImageRole = new Set<number>();
   private jsTree?: { entries: Array<[PdfString, PdfObject]> };
   private efTree?: { entries: Array<[PdfString, PdfObject]> };
   private readonly keptDocScripts: string[] = [];
@@ -411,6 +418,7 @@ export class Walker {
   private readonly newNum = new Map<number, number>();
   private synthJs = 0;
   private synthEf = 0;
+  private synthXfaImages = 0;
 
   constructor(
     private readonly doc: PdfDocument,
@@ -544,6 +552,8 @@ export class Walker {
       if (uri instanceof PdfDict) this.uriBase = text(await doc.resolve(uri.get('Base')));
       if (this.annotPage.size) await this.buildAltText(catalog.get('StructTreeRoot'));
       await this.prepassDocumentScripts(catalog);
+      const nameDict = await doc.resolve(catalog.get('Names'));
+      if (nameDict instanceof PdfDict && nameDict.has('XFAImages')) this.xfaImages = { found: await this.collectNameTree(nameDict.get('XFAImages')), entries: [] };
     }
     this.enqueue(root, { location: 'document catalog' });
     if (info instanceof PdfRef) {
@@ -981,6 +991,15 @@ export class Walker {
     // read as removed content. That waits until the walk is done, so a real visit of a field always comes first.
     for (const num of this.coFields) if (!this.visited.has(num)) await this.processRef(new PdfRef(num, doc.genOf(num)), { location: 'form', shadow: true });
     await this.drain();
+    // No XFA form in the output shows these images, so none stays.
+    if (this.xfaImages && !this.xfaImages.keys) {
+      this.xfaImages.keys = new Set();
+      for (const [name, value] of this.xfaImages.found) {
+        this.emitRemoval(C.Form, D.XfaImage, `XFA images, "${short(decodeTextString(name.bytes))}"`, { type: '', reason: 'No XFA form in the output shows it' });
+        await this.reach(value);
+      }
+      if (this.xfaImages.found.length) this.removedAt ??= 'XFA images';
+    }
     // Further names are decided only during the walk.
     for (const d of this.fileDecisions.values()) {
       const decoded = d.types?.decoded;
@@ -1116,7 +1135,12 @@ export class Walker {
         return undefined;
       // A stream decided as a contained file stays one, whether or not it says /Type /EmbeddedFile, unless it is a page's
       // content: only the reference that made it a contained file goes then.
-      let kind = obj instanceof PdfStream && this.xfaRole.has(num) ? 'generic' : obj instanceof PdfStream && this.fileDecisions.has(num) ? 'efStream' : this.kindOf(obj, num, await this.actionType(d));
+      let kind =
+        obj instanceof PdfStream && (this.xfaRole.has(num) || this.xfaImageRole.has(num))
+          ? 'generic'
+          : obj instanceof PdfStream && this.fileDecisions.has(num)
+            ? 'efStream'
+            : this.kindOf(obj, num, await this.actionType(d));
       if (kind === 'efStream' && this.contentRole.has(num)) kind = 'generic';
       // Nothing reads a stream encrypted with a key the password does not give, and pdf.js draws a page without it.
       // An attached file reports its own removal.
@@ -1532,6 +1556,10 @@ export class Walker {
           }
           if (this.efTree.entries.length < entries.length) this.removedAt ??= 'attachments';
         } else if (this.phase === 'B' && this.efTree?.entries.length) out.set(k, new PdfRef(-2, 0));
+      } else if (k === 'XFAImages') {
+        // Decided by the XFA form, and written anew from the entries kept.
+        if (this.phase === 'A') out.set(k, v);
+        else if (this.xfaImages?.entries.length) out.set(k, new PdfRef(-3, 0));
       } else if (k === 'AlternatePresentations') {
         const entries = await this.collectNameTree(v);
         const f = this.emit(C.Media, D.Slideshow, 'document', { count: entries.length });
@@ -1627,7 +1655,8 @@ export class Walker {
     } catch {
       throw new XfaReadError('bytes that are not UTF-8');
     }
-    const plan = planXfa(whole, { stripMetadata: this.options.stripMetadata });
+    const imageKeys = new Set((this.xfaImages?.found ?? []).map(([name]) => decodeTextString(name.bytes)));
+    const plan = planXfa(whole, { stripMetadata: this.options.stripMetadata, imageKeys });
     const edits: XfaEdit[] = [];
     const cut: Array<[number, number]> = [];
     const inCut = (a: number, b: number) => cut.some(([x, y]) => a >= x && b <= y);
@@ -1660,7 +1689,9 @@ export class Walker {
     }
     for (const l of plan.links) {
       if (inCut(l.start, l.end)) continue;
-      if (!this.decideXfaLink(l.uri, where(l.packet, l.som))) edits.push({ start: l.start, end: l.end, insert: '' });
+      // A reader that decodes references without their ; reads another address, which must be safe too.
+      const keep = this.decideXfaLink(l.uri, where(l.packet, l.som)) && (l.looseUri === undefined || this.decideXfaLink(l.looseUri, where(l.packet, l.som)));
+      if (!keep) edits.push({ start: l.start, end: l.end, insert: '' });
     }
     for (const img of plan.images) {
       if (inCut(img.start, img.end)) continue;
@@ -1668,6 +1699,9 @@ export class Walker {
       if (!d.keep) edits.push({ start: img.start, end: img.end, insert: '' });
       else if (d.data !== undefined) edits.push({ start: img.start, end: img.end, insert: d.data });
     }
+    const keptKeys = await this.decideXfaImageTree();
+    // An href that names an entry no longer in the tree goes with it.
+    for (const ref of plan.imageRefs) if (!inCut(ref.start, ref.end) && !keptKeys.has(ref.key)) edits.push({ start: ref.start, end: ref.end, insert: '' });
     if (!edits.length) return v;
     const bounds = [0];
     for (const b of bodies) bounds.push(bounds[bounds.length - 1] + b.length);
@@ -1702,7 +1736,7 @@ export class Walker {
       this.pushScript(verify.findings, location);
       return { keep: true };
     }
-    const language = sc.language === 'formcalc' ? 'FormCalc' : sc.language === 'javascript' ? 'JavaScript' : short(sc.contentType || 'an unreadable form', 40);
+    const language = sc.unreadable ? 'an unreadable form' : sc.language === 'formcalc' ? 'FormCalc' : sc.language === 'javascript' ? 'JavaScript' : short(sc.contentType || 'an unreadable form', 40);
     const f = this.cfg.factory.make(C.JavaScript, D.Xfa, location, { trigger, length: sc.text.length, language });
     let decision: { keep: boolean; text?: string } = { keep: f.action !== 'strip' && sc.language !== undefined };
     let answer: PdfFinding | undefined;
@@ -1766,6 +1800,16 @@ export class Walker {
       return { keep: false };
     }
     const bytes = Buffer.from(b64, 'base64');
+    const d = await this.judgeXfaImage(bytes, img.contentType, loc);
+    return { keep: d.keep, data: d.written?.toString('base64') };
+  }
+
+  /**
+   * Shows an XFA image's bytes to the file plugins. Returns whether it stays, and the bytes a plugin wrote when they
+   * differ from the ones it got.
+   */
+  private async judgeXfaImage(bytes: Buffer, declared: string, loc: string, name?: string): Promise<{ keep: boolean; written?: Buffer }> {
+    const type = short(declared, 40);
     const hash = createHash('md5').update(bytes).digest('hex');
     const expected = this.cfg.verify?.files.get(hash);
     if (expected) {
@@ -1774,7 +1818,15 @@ export class Walker {
       return { keep: true };
     }
     const sniffed = sniffType(bytes.subarray(0, 1024));
-    const file: ContainedFile = { declaredType: img.contentType || undefined, sniffedType: sniffed, size: bytes.length, location: loc, depth: this.cfg.depth + 1, source: bufferSource(bytes) };
+    const file: ContainedFile = {
+      ...(name === undefined ? {} : { name }),
+      declaredType: declared || undefined,
+      sniffedType: sniffed,
+      size: bytes.length,
+      location: loc,
+      depth: this.cfg.depth + 1,
+      source: bufferSource(bytes),
+    };
     const context: RunContext = { depth: file.depth, deadline: this.cfg.deadline, [RUN_OPTIONS]: this.options };
     for (const plugin of this.options.filePlugins ?? []) {
       try {
@@ -1795,7 +1847,7 @@ export class Walker {
           this.emit(C.Form, r.result === 'passed' ? D.PluginPassed : D.PluginScrubbed, loc, data);
           // Bytes the plugin wrote are the ones kept.
           this.kept.files.set(written ? outSink.digest() : hash, { result: r.result, plugin: plugin.name, findings: r.outputFindings });
-          return { keep: true, data: written && !written.equals(bytes) ? written.toString('base64') : undefined };
+          return { keep: true, written: written && !written.equals(bytes) ? written : undefined };
         }
         this.emitRemoval(C.Form, r.result === 'removed' ? D.PluginRemoved : D.PluginFailed, loc, data);
         return { keep: false };
@@ -1809,6 +1861,67 @@ export class Walker {
     }
     const f = this.emit(C.Form, D.XfaImage, loc, { type: type || sniffed || '' });
     return { keep: f.action !== 'strip' };
+  }
+
+  /**
+   * Decides the catalog's XFAImages entries, once, for the first XFA form that stays. Each image goes to the file
+   * plugins as an inline XFA image does. Returns the keys of the entries kept.
+   */
+  private async decideXfaImageTree(): Promise<Set<string>> {
+    const tree = this.xfaImages;
+    if (!tree) return new Set();
+    if (tree.keys) return tree.keys;
+    const keys = new Set<string>();
+    tree.keys = keys;
+    for (const [idx, [name, value]] of tree.found.entries()) {
+      const key = decodeTextString(name.bytes);
+      const loc = `XFA images, "${short(key)}"`;
+      const { value: obj, num } = await this.lastRef(value);
+      if (!(obj instanceof PdfStream) || num === undefined) {
+        // pdf.js reads only streams here. Anything else is left out unless the caller keeps malformed objects.
+        if (this.emit(C.Corrupted, D.MalformedObject, loc, { reason: 'not a stream' }).action === 'strip') {
+          await this.reach(value);
+          this.removedAt ??= loc;
+          continue;
+        }
+        const x = await this.tv(value, { location: loc }, `xfaimage#${idx}`, '');
+        if (x !== undefined) tree.entries.push([name, x]);
+        continue;
+      }
+      const gone = async (reason?: string) => {
+        if (reason) this.emitRemoval(C.Form, D.XfaImage, loc, { type: '', reason });
+        await this.reach(value);
+        this.removedAt ??= loc;
+      };
+      if (!this.doc.canDecrypt(obj, num)) {
+        await gone('It is encrypted with a key the password does not give');
+        continue;
+      }
+      let bytes: Buffer;
+      try {
+        const raw = await this.doc.decode(obj, num, this.options.limits?.decompressedBytes);
+        bytes = Buffer.from(raw.buffer, raw.byteOffset, raw.length);
+      } catch (e) {
+        if (e instanceof DecompressionLimitError || e instanceof TimeLimitError || e instanceof ObjectLimitError) throw e;
+        this.passOn(e);
+        await gone('It could not be decoded');
+        continue;
+      }
+      const d = await this.judgeXfaImage(bytes, '', loc, key);
+      if (!d.keep) {
+        await gone();
+        continue;
+      }
+      const ref = new PdfRef(num, this.doc.genOf(num));
+      this.xfaImageRole.add(num);
+      if (d.written) this.xfaReplace.set(num, d.written);
+      await this.processRef(ref, { location: loc });
+      // Another reference can have removed the stream already.
+      if (!this.visited.has(num) || this.dropped.has(num)) continue;
+      tree.entries.push([name, ref]);
+      keys.add(key);
+    }
+    return keys;
   }
 
   /** A link in an XFA form's rich text, checked as a link action's address is. Returns whether it stays. */
@@ -2735,15 +2848,18 @@ export class Walker {
     this.order = this.order.filter(num => !this.dropped.has(num));
     if (this.jsTree) this.jsTree.entries = this.jsTree.entries.filter(([, v]) => !(v instanceof PdfRef && this.dropped.has(v.num)));
     if (this.efTree) this.efTree.entries = this.efTree.entries.filter(([, v]) => !(v instanceof PdfRef && this.dropped.has(v.num)));
+    if (this.xfaImages) this.xfaImages.entries = this.xfaImages.entries.filter(([, v]) => !(v instanceof PdfRef && this.dropped.has(v.num)));
     let n = 1;
     for (const num of this.order) this.newNum.set(num, n++);
     if (this.jsTree?.entries.length) this.synthJs = n++;
     if (this.efTree?.entries.length) this.synthEf = n++;
+    if (this.xfaImages?.entries.length) this.synthXfaImages = n++;
     const total = n;
     const offsets = new Array<number>(total).fill(0);
     const mapRef = (r: PdfRef): PdfRef | null => {
       if (r.num === -1) return this.synthJs ? new PdfRef(this.synthJs, 0) : null;
       if (r.num === -2) return this.synthEf ? new PdfRef(this.synthEf, 0) : null;
+      if (r.num === -3) return this.synthXfaImages ? new PdfRef(this.synthXfaImages, 0) : null;
       const m = this.newNum.get(r.num);
       return m ? new PdfRef(m, 0) : null;
     };
@@ -2779,6 +2895,10 @@ export class Walker {
     if (this.synthEf) {
       if (!this.efTree) throw new Error('No EmbeddedFiles name tree to write');
       await writeTree(this.synthEf, this.efTree.entries);
+    }
+    if (this.synthXfaImages) {
+      if (!this.xfaImages) throw new Error('No XFAImages name tree to write');
+      await writeTree(this.synthXfaImages, this.xfaImages.entries);
     }
     const xrefAt = out.offset;
     let xref = `xref\n0 ${total}\n0000000000 65535 f\r\n`;
@@ -2870,6 +2990,7 @@ export class Walker {
   releaseState(): Promise<void> {
     this.jsTree = undefined;
     this.efTree = undefined;
+    this.xfaImages = undefined;
     this.pageInfo.clear();
     this.pageOrder.length = 0;
     this.treeNodes.clear();
@@ -2892,6 +3013,7 @@ export class Walker {
     this.xfaReplace.clear();
     this.xfaDone.clear();
     this.xfaRole.clear();
+    this.xfaImageRole.clear();
     this.annotPage.clear();
     this.altText.clear();
     this.refusedSlots.clear();

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 - 2026-11-18
+
+- Images in the catalog's `/Names /XFAImages` tree go to the file plugins as inline XFA images do. 0.3.1 copied them to the output unseen, so a crafted TIFF there skipped the check FORM/XFA_IMAGE makes for inline images. An entry no plugin keeps now goes as FORM/XFA_IMAGE, and so do the hrefs that name it. With no XFA form in the output, the whole tree goes.
+- An image href that names an XFAImages entry stays. 0.3.1 removed one that read like a Windows path as FORM/XFA_EXTERNAL_REFERENCE, and the form lost an image the file carried.
+- A bare `&` in XFA text is read as `&`, as pdf.js reads it. 0.3.1 removed the whole form as FORM/XFA_UNREADABLE. A script holding a bare `&` followed by `#` or a letter goes as JAVASCRIPT/XFA, since readers decode it differently, and the form stays. A rich text link is checked under both readings.
+- A terminated reference longer than 12 characters still makes the form unreadable, with the reason "an entity reference that is too long".
+
 ## 0.3.1 - 2026-10-17
 
 - The private method that resolves a PDF reference is `readEntry`, not `fetch`. Security scanners took the old name, borrowed from pdf.js's `xref.fetch`, for network access. pdf-defuse never used the network, and nothing else changes.

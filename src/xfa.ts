@@ -41,6 +41,46 @@ const PREDEFINED: Record<string, string> = { lt: '<', gt: '>', amp: '&', quot: '
 
 const localOf = (name: string) => name.slice(name.indexOf(':') + 1);
 
+/**
+ * Where the reference an & starts ends: the index of its `;`, or -1 for a bare &. pdf.js reads a reference as `&`, at
+ * least one character that is neither `;` nor `&`, then `;`, and reads any other & as text.
+ */
+function referenceEnd(raw: string, amp: number): number {
+  let j = amp + 1;
+  while (j < raw.length && raw[j] !== ';' && raw[j] !== '&') j++;
+  return j < raw.length && raw[j] === ';' && j > amp + 1 ? j : -1;
+}
+
+/**
+ * Whether raw text holds a bare & followed by `#` or a letter. pdf.js reads it as text, but a reader that decodes
+ * references without their `;`, as HTML does `&quot` or `&#60`, reads other characters there.
+ */
+export function hasLooseReference(raw: string): boolean {
+  for (let amp = raw.indexOf('&'); amp >= 0; amp = raw.indexOf('&', amp + 1)) if (referenceEnd(raw, amp) < 0 && /[#A-Za-z]/.test(raw[amp + 1] ?? '')) return true;
+  return false;
+}
+
+/**
+ * The text a lenient reader gives for raw text: each bare & that starts one of the five predefined entities, in any
+ * case, or a character reference, read as that character without its `;`. Other text is decoded as decodeXmlText does.
+ */
+export function looseReading(raw: string): string {
+  const named: Record<string, string> = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" };
+  let out = '';
+  let at = 0;
+  for (let amp = raw.indexOf('&'); amp >= 0; amp = raw.indexOf('&', amp + 1)) {
+    if (amp < at || referenceEnd(raw, amp) >= 0) continue;
+    const m = /^&(?:#[xX]([0-9a-fA-F]{1,6})|#([0-9]{1,7})|(lt|gt|amp|quot|apos))/i.exec(raw.slice(amp, amp + 12));
+    if (!m) continue;
+    const code = m[1] ? Number.parseInt(m[1], 16) : m[2] ? Number.parseInt(m[2], 10) : -1;
+    const ch = code >= 0 ? (code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : undefined) : named[(m[3] ?? '').toLowerCase()];
+    if (ch === undefined) continue;
+    out += `${decodeXmlText(raw.slice(at, amp))}${ch}`;
+    at = amp + m[0].length;
+  }
+  return out + decodeXmlText(raw.slice(at));
+}
+
 /** Decodes entity and character references in latin1 text read from UTF-8 bytes, then the UTF-8. */
 export function decodeXmlText(raw: string): string {
   const utf8 = (s: string) => Buffer.from(s, 'latin1').toString('utf8');
@@ -51,8 +91,14 @@ export function decodeXmlText(raw: string): string {
     const amp = raw.indexOf('&', i);
     if (amp < 0) break;
     out += utf8(raw.slice(i, amp));
-    const semi = raw.indexOf(';', amp);
-    if (semi < 0 || semi - amp > 12) throw new XfaReadError('an entity reference that does not end');
+    const semi = referenceEnd(raw, amp);
+    // pdf.js reads an & that starts no terminated reference as the character itself, and so does pdf-defuse.
+    if (semi < 0) {
+      out += '&';
+      i = amp + 1;
+      continue;
+    }
+    if (semi - amp > 12) throw new XfaReadError('an entity reference that is too long');
     const ref = raw.slice(amp + 1, semi);
     if (ref.startsWith('#')) {
       const code = ref[1] === 'x' ? Number.parseInt(ref.slice(2), 16) : Number.parseInt(ref.slice(1), 10);
@@ -218,8 +264,10 @@ export interface XfaScript {
   start: number;
   end: number;
   text: string;
-  /** undefined for a content type no plugin reads, or content that is not plain text. */
+  /** undefined for a content type no plugin reads, content that is not plain text, or text readers read apart. */
   language?: 'javascript' | 'formcalc';
+  /** Set when the text holds a bare & that a lenient reader decodes, so no plugin can judge what a viewer runs. */
+  unreadable?: boolean;
   contentType: string;
   /** The SOM path of the node the script belongs to. */
   som: string;
@@ -244,8 +292,18 @@ export interface XfaLink {
   start: number;
   end: number;
   uri: string;
+  /** The address a reader that decodes references without their `;` reads, when that differs from `uri`. */
+  looseUri?: string;
   packet: string;
   som: string;
+}
+
+/** An image href that names an entry of the catalog's XFAImages name tree, which stays only while the entry does. */
+export interface XfaImageRef {
+  /** The href attribute. */
+  start: number;
+  end: number;
+  key: string;
 }
 
 /** An image a template, form or data value carries inline, which a viewer decodes. */
@@ -267,6 +325,7 @@ export interface XfaPlan {
   removals: XfaRemoval[];
   links: XfaLink[];
   images: XfaImage[];
+  imageRefs: XfaImageRef[];
 }
 
 /** Packets a defused form keeps. The rest, such as stylesheets, embedded PDFs, XFDF and signatures, go. */
@@ -320,10 +379,10 @@ const activityOf = (el: XElement): string => {
   return 'unknown';
 };
 
-export function planXfa(s: string, options: { stripMetadata?: boolean } = {}): XfaPlan {
+export function planXfa(s: string, options: { stripMetadata?: boolean; imageKeys?: ReadonlySet<string> } = {}): XfaPlan {
   const root = readXml(s);
   if (root.local !== 'xdp') throw new XfaReadError(`a root element <${root.name}> that is not an XDP`);
-  const plan: XfaPlan = { root, scripts: [], removals: [], links: [], images: [] };
+  const plan: XfaPlan = { root, scripts: [], removals: [], links: [], images: [], imageRefs: [] };
   // An action is reported at the node it belongs to; a connection, which has a name of its own, at itself.
   const remove = (el: XElement, kind: XfaRemovalKind, packet: string, what: string, own = false) =>
     plan.removals.push({ start: el.start, end: el.end, kind, packet, som: somOf(own ? el : (el.parent ?? el)), what });
@@ -355,7 +414,17 @@ export function planXfa(s: string, options: { stripMetadata?: boolean } = {}): X
     }
     for (const a of el.attrs) {
       if (a.local === 'href' && a.value.trim()) {
-        if (el.local === 'a') plan.links.push({ start: a.start, end: a.end, uri: a.value, packet, som: somOf(el) });
+        if (el.local === 'a') {
+          const loose = looseReading(
+            s
+              .slice(a.start, a.end)
+              .replace(/^[^"']*["']/, '')
+              .slice(0, -1),
+          ).replace(/[\t\n\r]/g, ' ');
+          plan.links.push({ start: a.start, end: a.end, uri: a.value, ...(loose !== a.value ? { looseUri: loose } : {}), packet, som: somOf(el) });
+        }
+        // An image href that names an XFAImages entry is inside the PDF, whatever it looks like.
+        else if (el.local === 'image' && options.imageKeys?.has(a.value)) plan.imageRefs.push({ start: a.start, end: a.end, key: a.value });
         else if (!isLocalHref(a.value)) cutAttr(a, el, packet, `${el.local} href ${a.value.slice(0, 120)}`);
       } else if (a.local === 'usehref' && !isLocalUse(a.value)) cutAttr(a, el, packet, `${el.local} usehref ${a.value.slice(0, 120)}`);
       else if (code && SERVER_ATTRIBUTES.has(a.local) && a.value.trim()) cutAttr(a, el, packet, `${el.local} ${a.local} ${a.value.slice(0, 120)}`);
@@ -381,12 +450,14 @@ export function planXfa(s: string, options: { stripMetadata?: boolean } = {}): X
       const ct = contentType.toLowerCase();
       const language = !ct || ct === 'application/x-formcalc' ? 'formcalc' : /javascript|ecmascript/.test(ct) ? 'javascript' : undefined;
       const text = el.children.length ? '' : textOf(s, el);
+      const unreadable = el.texts.some(t => !t.cdata && hasLooseReference(s.slice(t.start, t.end)));
       if (el.children.length || text.trim())
         plan.scripts.push({
           start: el.openEnd,
           end: el.closeStart,
           text,
-          language: el.children.length ? undefined : language,
+          language: el.children.length || unreadable ? undefined : language,
+          ...(unreadable ? { unreadable } : {}),
           contentType,
           som: somOf(el),
           activity: activityOf(el),
